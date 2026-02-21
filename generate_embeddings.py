@@ -4,6 +4,7 @@ Voyage AI is Anthropic's recommended embedding provider
 """
 
 import os
+import re
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 import voyageai
@@ -20,10 +21,10 @@ VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
 
 # Voyage embedding model
 # voyage-3 is the latest, best for retrieval tasks
-# Output dimension: 1024 (update database if using this)
-# OR use voyage-3-lite for faster/cheaper with 512 dimensions
-EMBEDDING_MODEL = "voyage-3-lite"
-EMBEDDING_DIMENSION = 512  # Update this based on model
+# Output dimension depends on model and API behavior.
+# We probe this at runtime to prevent schema mismatches.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "voyage-3-lite")
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "0"))  # 0 = auto-detect
 
 # Batch size for API calls (Voyage allows up to 128 texts per batch)
 BATCH_SIZE = 128
@@ -41,9 +42,38 @@ def get_engine():
     return create_engine(f"postgresql://{user}:{password}@{host}:{port}/{database}")
 
 
+def get_current_embedding_dimension(engine):
+    """Return current vector dimension for document_chunks.embedding, or None if unavailable."""
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT format_type(a.atttypid, a.atttypmod) AS embedding_type
+            FROM pg_attribute a
+            JOIN pg_class c ON a.attrelid = c.oid
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE c.relname = 'document_chunks'
+              AND a.attname = 'embedding'
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            LIMIT 1
+        """))
+        row = result.fetchone()
+
+    if not row or not row[0]:
+        return None
+
+    match = re.search(r'vector\((\d+)\)', row[0])
+    return int(match.group(1)) if match else None
+
+
 def update_embedding_dimension(engine, dimension):
-    """Update the embedding vector dimension in the database."""
-    print(f"Updating embedding dimension to {dimension}...")
+    """Update the embedding vector dimension in the database if needed."""
+    current_dimension = get_current_embedding_dimension(engine)
+
+    if current_dimension == dimension:
+        print(f"✓ Embedding dimension already set to {dimension}; reusing existing column")
+        return
+
+    print(f"Updating embedding dimension from {current_dimension} to {dimension}...")
     with engine.connect() as conn:
         # Drop and recreate the embedding column with correct dimension
         conn.execute(text(f"""
@@ -67,11 +97,21 @@ def update_embedding_dimension(engine, dimension):
         print("✓ Embedding column updated")
 
 
+def probe_model_dimension(voyage_client):
+    """Probe the model to get the actual embedding vector length."""
+    result = voyage_client.embed(
+        texts=["dimension probe"],
+        model=EMBEDDING_MODEL,
+        input_type="document"
+    )
+    return len(result.embeddings[0])
+
+
 # ─────────────────────────────────────────────
 # EMBEDDING GENERATION
 # ─────────────────────────────────────────────
 
-def generate_embeddings(texts, voyage_client):
+def generate_embeddings(texts, voyage_client, expected_dimension):
     """
     Generate embeddings for a batch of texts using Voyage AI.
     """
@@ -81,13 +121,17 @@ def generate_embeddings(texts, voyage_client):
             model=EMBEDDING_MODEL,
             input_type="document"  # Use "document" for texts to be retrieved
         )
+        if result.embeddings and len(result.embeddings[0]) != expected_dimension:
+            raise ValueError(
+                f"Model returned dimension {len(result.embeddings[0])}, expected {expected_dimension}"
+            )
         return result.embeddings
     except Exception as e:
         print(f"Error generating embeddings: {e}")
         return None
 
 
-def process_chunks(engine, voyage_client):
+def process_chunks(engine, voyage_client, embedding_dimension):
     """
     Fetch all chunks without embeddings and generate them in batches.
     """
@@ -105,7 +149,7 @@ def process_chunks(engine, voyage_client):
     print(f"\nGenerating embeddings for {total_chunks:,} chunks...")
     print(f"Model: {EMBEDDING_MODEL}")
     print(f"Batch size: {BATCH_SIZE}")
-    print(f"Dimension: {EMBEDDING_DIMENSION}")
+    print(f"Dimension: {embedding_dimension}")
     print("=" * 60)
     
     # Process in batches
@@ -134,7 +178,7 @@ def process_chunks(engine, voyage_client):
             chunk_texts = [row[1] for row in batch]
             
             # Generate embeddings
-            embeddings = generate_embeddings(chunk_texts, voyage_client)
+            embeddings = generate_embeddings(chunk_texts, voyage_client, embedding_dimension)
             
             if embeddings is None:
                 print(f"\n✗ Failed to generate embeddings for batch starting at offset {offset}")
@@ -230,15 +274,27 @@ def main():
     print("\nInitializing Voyage AI client...")
     voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY)
     print("✓ Voyage AI client initialized")
+
+    # Determine actual model output dimension
+    model_dimension = probe_model_dimension(voyage_client)
+    print(f"✓ Model output dimension: {model_dimension}")
+
+    if EMBEDDING_DIMENSION > 0 and EMBEDDING_DIMENSION != model_dimension:
+        print(
+            f"⚠ EMBEDDING_DIMENSION={EMBEDDING_DIMENSION} does not match model output "
+            f"dimension {model_dimension}; using {model_dimension}."
+        )
+
+    embedding_dimension = model_dimension
     
     # Get database engine
     engine = get_engine()
     
     # Update embedding dimension if needed
-    update_embedding_dimension(engine, EMBEDDING_DIMENSION)
+    update_embedding_dimension(engine, embedding_dimension)
     
     # Generate embeddings
-    process_chunks(engine, voyage_client)
+    process_chunks(engine, voyage_client, embedding_dimension)
     
     # Print statistics
     print_statistics(engine)
