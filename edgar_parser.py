@@ -1,21 +1,34 @@
 """
-EDGAR Filing Parser
-Parses markdown filings into:
-1. Financial facts (structured table data) -> PostgreSQL
-2. Narrative chunks (text sections) -> pgvector embeddings
+EDGAR Filing Parser - XBRL Edition (Hardened)
+Uses edgartools XBRL API for financial fact extraction
+and markdown parsing for narrative RAG chunks.
+
+Hardening updates:
+1) Unit-aware value normalization (avoid blind scaling to millions)
+2) Explicit dedupe keys + ON CONFLICT DO NOTHING inserts
 """
 
 import os
 import re
-import json
-from pathlib import Path
-from datetime import datetime
 from dotenv import load_dotenv
-import psycopg2
-from psycopg2.extras import execute_values
 from sqlalchemy import create_engine, text
+from edgar import Company, set_identity
 
 load_dotenv()
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+
+TICKERS = ["AMZN", "GOOGL", "META", "MSFT", "ORCL"]
+START_DATE = "2023-01-01"
+FILING_TYPES = ["10-K", "10-Q"]
+
+# Set your SEC identity (required)
+USER_NAME = "Daniel Savage"
+USER_EMAIL = "dan.mcsavage@gmail.com"
+set_identity(f"{USER_NAME} {USER_EMAIL}")
+
 
 # ─────────────────────────────────────────────
 # DATABASE SETUP
@@ -33,7 +46,6 @@ def get_engine():
 def create_tables(engine):
     """Create database schema for financial facts and narrative chunks."""
     with engine.connect() as conn:
-        # Companies reference table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS companies (
                 id          SERIAL PRIMARY KEY,
@@ -44,37 +56,54 @@ def create_tables(engine):
             );
         """))
 
-        # Filings metadata table
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS filings (
                 id           SERIAL PRIMARY KEY,
                 ticker       TEXT NOT NULL,
-                filing_type  TEXT NOT NULL,   -- 10-K or 10-Q
+                filing_type  TEXT NOT NULL,
                 filing_date  DATE NOT NULL,
-                file_path    TEXT,
+                period_end   DATE,
+                accession    TEXT,
                 created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE (ticker, filing_type, filing_date)
             );
         """))
 
-        # Structured financial facts from tables
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS financial_facts (
-                id           SERIAL PRIMARY KEY,
-                ticker       TEXT NOT NULL,
-                filing_date  DATE NOT NULL,
-                filing_type  TEXT NOT NULL,
-                period_date  DATE NOT NULL,   -- The date the value refers to
-                metric       TEXT NOT NULL,   -- e.g. "Total stockholders equity"
-                value        NUMERIC,
-                unit         TEXT DEFAULT 'millions',
-                audited      BOOLEAN DEFAULT TRUE,
-                section      TEXT,            -- e.g. "CONSOLIDATED BALANCE SHEETS"
-                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                id               SERIAL PRIMARY KEY,
+                ticker           TEXT NOT NULL,
+                filing_date      DATE NOT NULL,
+                filing_type      TEXT NOT NULL,
+                period_date      DATE NOT NULL,
+                statement_type   TEXT NOT NULL,
+                concept          TEXT NOT NULL,
+                label            TEXT NOT NULL,
+                standard_concept TEXT,
+                value            NUMERIC,
+                unit             TEXT DEFAULT 'USD',
+                unit_confidence  TEXT DEFAULT 'unknown',
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """))
 
-        # Narrative text chunks for RAG
+        conn.execute(text("""
+            ALTER TABLE financial_facts
+            ADD COLUMN IF NOT EXISTS unit_confidence TEXT DEFAULT 'unknown';
+        """))
+
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_financial_facts_lookup
+            ON financial_facts(ticker, period_date, concept);
+        """))
+
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_financial_facts_dedupe
+            ON financial_facts(
+                ticker, filing_type, filing_date, period_date, statement_type, concept, unit
+            );
+        """))
+
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS document_chunks (
                 id           SERIAL PRIMARY KEY,
@@ -84,9 +113,38 @@ def create_tables(engine):
                 section      TEXT,
                 chunk_index  INTEGER,
                 chunk_text   TEXT NOT NULL,
-                embedding    vector(1536),    -- OpenAI/Voyage embedding size
+                embedding    vector(1536),
                 created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+        """))
+
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_document_chunks_dedupe
+            ON document_chunks(
+                ticker, filing_type, filing_date, section, chunk_index
+            );
+        """))
+
+        conn.execute(text("""
+            CREATE OR REPLACE VIEW financial_facts_clean AS
+            SELECT DISTINCT ON (ticker, period_date, concept)
+                ticker,
+                period_date,
+                statement_type,
+                concept,
+                label,
+                standard_concept,
+                value,
+                unit,
+                filing_type,
+                filing_date
+            FROM financial_facts
+            ORDER BY
+                ticker,
+                period_date,
+                concept,
+                CASE WHEN filing_type = '10-K' THEN 0 ELSE 1 END,
+                filing_date DESC;
         """))
 
         conn.commit()
@@ -94,241 +152,352 @@ def create_tables(engine):
 
 
 # ─────────────────────────────────────────────
-# PARSING UTILITIES
+# XBRL FINANCIAL STATEMENT EXTRACTION
 # ─────────────────────────────────────────────
 
-def parse_filename(filepath: Path) -> tuple[str, str, str]:
+NON_MONETARY_LABEL_HINTS = (
+    'per share', 'share', 'shares', 'weighted average', 'ratio', 'percent', '%',
+    'employees', 'headcount', 'units'
+)
+
+NON_MONETARY_CONCEPT_HINTS = (
+    'shares', 'share', 'pershare', 'per_share', 'ratio', 'percentage',
+    'percent', 'weightedaverage', 'weighted_average', 'headcount'
+)
+
+DATE_RE = re.compile(r'(20\d{2}-\d{2}-\d{2})')
+MONETARY_UNIT_TOKENS = ('usd', 'dollar', '$', 'million', 'billion', 'thousand')
+MAX_CHUNKS_PER_SECTION = 120
+
+SECTION_CANONICAL_MAP = {
+    'risks related to our product offerings': 'Risk Factors - Product Offerings',
+    'sensitivity analysis': 'Sensitivity Analysis',
+    'industry trends and opportunities': 'Industry Trends and Opportunities',
+    'commitments and contingencies': 'Commitments and Contingencies',
+    'legal proceedings': 'Legal Proceedings',
+    'note about forward-looking statements': 'Forward-Looking Statements',
+}
+
+SECTION_PATTERN_RULES = [
+    ('incorporated herein by reference', 'Incorporation by Reference'),
+    ('the information required by this item', 'Incorporation by Reference'),
+    ('in addition, our business may be adversely affected if', 'Risk Factors - Additional Risks'),
+    ('our international operations expose us to a number of risks', 'Risk Factors - International Operations'),
+    ('risks relating to the evolution of our business', 'Risk Factors - Business Evolution'),
+    ('operational risks', 'Risk Factors - Operational Risks'),
+    ('legal and regulatory risks', 'Risk Factors - Legal and Regulatory'),
+    ('strategic and competitive risks', 'Risk Factors - Strategic and Competitive'),
+    ('general risks', 'Risk Factors - General'),
+    ('critical accounting estimates', 'Critical Accounting Estimates'),
+    ('liquidity and capital resources', 'Liquidity and Capital Resources'),
+    ('business overview', 'Overview'),
+    ('competition among platform-based ecosystems', 'Competition'),
+]
+
+
+def is_nan(value):
+    return isinstance(value, float) and value != value
+
+
+def infer_period_and_unit(column_key):
+    """Infer period date and unit hint from dataframe column metadata."""
+    if isinstance(column_key, (tuple, list)):
+        date_value = None
+        unit_parts = []
+
+        for part in column_key:
+            part_str = str(part)
+            match = DATE_RE.search(part_str)
+            if match and not date_value:
+                date_value = match.group(1)
+                continue
+            if part_str.strip():
+                unit_parts.append(part_str.strip())
+
+        unit_hint = ' '.join(unit_parts).strip() or None
+        return date_value, unit_hint
+
+    col_text = str(column_key)
+    match = DATE_RE.search(col_text)
+    if not match:
+        return None, None
+
+    date_value = match.group(1)
+    unit_hint = re.sub(DATE_RE, '', col_text).strip(' _|:-()[]{}') or None
+    return date_value, unit_hint
+
+
+def extract_period_specs(statement_df):
+    """Return list of (column_key, period_date, unit_hint_from_column)."""
+    period_specs = []
+    for column_key in statement_df.columns:
+        period_date, unit_hint = infer_period_and_unit(column_key)
+        if period_date:
+            period_specs.append((column_key, period_date, unit_hint))
+    return period_specs
+
+
+def detect_unit_hint(row, unit_hint_from_column=None):
+    for col in ('unit', 'units', 'uom', 'measure', 'currency'):
+        if col in row and row[col] not in (None, ''):
+            return str(row[col])
+
+    return unit_hint_from_column
+
+
+def is_likely_non_monetary(concept, label, unit_hint):
+    text_blob = f"{concept or ''} {label or ''} {unit_hint or ''}".lower()
+    concept_blob = (concept or '').replace('-', '').replace('_', '').lower()
+    return (
+        any(hint in text_blob for hint in NON_MONETARY_LABEL_HINTS)
+        or any(hint in concept_blob for hint in NON_MONETARY_CONCEPT_HINTS)
+    )
+
+
+def is_explicit_monetary(unit_hint):
+    if not unit_hint:
+        return False
+    unit_text = unit_hint.lower()
+    return any(token in unit_text for token in MONETARY_UNIT_TOKENS)
+
+
+def normalize_value_and_unit(value, concept, label, unit_hint, statement_type):
     """
-    Extract ticker, filing_type, filing_date from filepath.
-    e.g. data/filings/GOOGL/10K_2026-02-05.md -> (GOOGL, 10-K, 2026-02-05)
+    Normalize values with unit awareness.
+
+    Strategy:
+    - Keep non-monetary metrics unscaled.
+        - For clear monetary units:
+      - already millions -> keep as-is
+      - billions -> convert to millions
+      - thousands -> convert to millions
+      - dollars/usd -> convert to millions
+        - If unit is unknown but this is a likely monetary statement fact,
+            infer dollars and convert to millions.
     """
-    ticker = filepath.parent.name.upper()
-    stem = filepath.stem  # e.g. 10K_2026-02-05
+    numeric = float(value)
+    unit_text = (unit_hint or '').lower()
 
-    if stem.startswith("10K"):
-        filing_type = "10-K"
-    elif stem.startswith("10Q"):
-        filing_type = "10-Q"
-    else:
-        filing_type = "UNKNOWN"
+    if not unit_hint:
+        if statement_type in {'balance_sheet', 'income_statement', 'cashflow'} and not is_likely_non_monetary(concept, label, unit_hint):
+            return numeric / 1_000_000, 'millions', 'inferred'
+        return numeric, 'unknown', 'unknown'
 
-    # Extract date portion
-    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', stem)
-    filing_date = date_match.group(1) if date_match else None
+    if is_likely_non_monetary(concept, label, unit_hint):
+        return numeric, unit_hint, 'explicit'
 
-    return ticker, filing_type, filing_date
+    if not is_explicit_monetary(unit_hint):
+        return numeric, unit_hint, 'explicit'
 
+    if 'billion' in unit_text:
+        return numeric * 1_000, 'millions', 'explicit'
 
-def clean_metric_name(raw: str) -> str:
-    """Clean up metric names from table cells."""
-    # Remove HTML artifacts
-    text = re.sub(r'<[^>]+>', '', raw)
-    # Collapse whitespace and newlines
-    text = re.sub(r'\s+', ' ', text)
-    # Remove leading/trailing whitespace
-    text = text.strip()
-    # Remove common noise characters
-    text = text.strip(':|$')
-    text = text.strip()
-    return text
+    if 'million' in unit_text:
+        return numeric, 'millions', 'explicit'
+
+    if 'thousand' in unit_text:
+        return numeric / 1_000, 'millions', 'explicit'
+
+    if any(token in unit_text for token in ('usd', 'dollar', '$')):
+        return numeric / 1_000_000, 'millions', 'explicit'
+
+    return numeric, unit_hint, 'explicit'
 
 
-def parse_value(raw: str) -> float | None:
-    """Parse numeric value from a table cell."""
-    if not raw:
-        return None
-    # Remove HTML, whitespace, dollar signs, commas
-    cleaned = re.sub(r'<[^>]+>', '', raw)
-    cleaned = re.sub(r'[\s,$]', '', cleaned)
-    # Handle negative numbers formatted as (1,234)
-    cleaned = re.sub(r'\((\d+)\)', r'-\1', cleaned)
-    # Remove dashes that mean zero
-    if cleaned in ['-', '—', '–', '']:
-        return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
-def parse_period_header(header_text: str) -> tuple[str | None, bool]:
+def extract_statement_facts(statement_df, statement_type, ticker, filing_date, filing_type):
     """
-    Extract a date from a column header and whether it's audited.
-    e.g. 'As of December 31, 2025' -> ('2025-12-31', True)
-    e.g. 'As of September 30, 2025 -unaudited' -> ('2025-09-30', False)
+    Extract financial facts from a statement dataframe.
+    Returns list of dicts ready for database insertion.
     """
-    audited = 'unaudited' not in header_text.lower()
+    clean = statement_df[~statement_df['abstract'] & ~statement_df['dimension']].copy()
 
-    # Month name patterns
-    month_map = {
-        'january': '01', 'february': '02', 'march': '03',
-        'april': '04', 'may': '05', 'june': '06',
-        'july': '07', 'august': '08', 'september': '09',
-        'october': '10', 'november': '11', 'december': '12'
-    }
-
-    # Match "Month DD, YYYY"
-    pattern = r'(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2}),?\s+(\d{4})'
-    match = re.search(pattern, header_text.lower())
-    if match:
-        month = month_map[match.group(1)]
-        day = match.group(2).zfill(2)
-        year = match.group(3)
-        return f"{year}-{month}-{day}", audited
-
-    # Match just year e.g. "2025" as fallback - treat as Dec 31
-    year_match = re.search(r'\b(20\d{2})\b', header_text)
-    if year_match:
-        return f"{year_match.group(1)}-12-31", audited
-
-    return None, audited
-
-
-# ─────────────────────────────────────────────
-# TABLE PARSER
-# ─────────────────────────────────────────────
-
-def parse_markdown_table(table_text: str, section_name: str, ticker: str,
-                          filing_date: str, filing_type: str) -> list[dict]:
-    """
-    Parse a markdown pipe table into financial fact rows.
-    Returns list of dicts ready for DB insertion.
-    """
-    rows = [line for line in table_text.strip().split('\n') if '|' in line]
-    if len(rows) < 2:
-        return []
+    period_specs = extract_period_specs(statement_df)
 
     facts = []
 
-    # ── Find header row and extract period dates ──────────────────────────────
-    # Header is typically the first row; separator row has dashes
-    header_row = rows[0]
-    header_cells = [c.strip() for c in header_row.split('|') if c.strip()]
+    for _, row in clean.iterrows():
+        concept = row['concept']
+        label = row['label']
+        standard_concept = row.get('standard_concept')
+        
+        for period_col, period_date, unit_hint_from_column in period_specs:
+            value = row[period_col]
+            unit_hint = detect_unit_hint(row, unit_hint_from_column=unit_hint_from_column)
 
-    # Combine header text to find date columns
-    # Header may span multiple rows for complex headers - join them
-    combined_header = ' '.join([
-        ' '.join([c.strip() for c in row.split('|') if c.strip()])
-        for row in rows[:3]  # Check first 3 rows for header info
-    ])
+            if value is None or value == '' or is_nan(value):
+                continue
 
-    # Find period dates from header
-    period_dates = []
-    # Look for date patterns in header cells
-    for cell in header_cells:
-        period, audited = parse_period_header(cell)
-        if period:
-            period_dates.append((period, audited))
+            try:
+                normalized_value, normalized_unit, unit_confidence = normalize_value_and_unit(
+                    value=value,
+                    concept=concept,
+                    label=label,
+                    unit_hint=unit_hint,
+                    statement_type=statement_type,
+                )
+            except (TypeError, ValueError):
+                continue
 
-    # If we couldn't find dates in individual cells, try combined header
-    if not period_dates:
-        # Find all dates in combined header
-        month_pattern = r'((?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4})'
-        date_mentions = re.findall(month_pattern, combined_header.lower())
-        for dm in date_mentions:
-            period, audited = parse_period_header(dm)
-            if period:
-                period_dates.append((period, audited))
-
-    if not period_dates:
-        return []  # Can't parse without period dates
-
-    # ── Skip header and separator rows, parse data rows ──────────────────────
-    data_rows = []
-    for row in rows:
-        # Skip separator rows (contain ---)
-        if re.match(r'^\|[-:\s|]+\|$', row):
-            continue
-        # Skip rows that are clearly headers (no numeric data)
-        cells = [c.strip() for c in row.split('|')]
-        cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells if c.strip()]
-        if cells:
-            data_rows.append(cells)
-
-    # Skip first 1-3 rows (headers)
-    # Find where numeric data starts
-    data_start = 0
-    for i, row_cells in enumerate(data_rows):
-        # Check if any cell looks like a number
-        has_number = any(parse_value(c) is not None for c in row_cells)
-        if has_number:
-            data_start = i
-            break
-
-    # ── Extract metric/value pairs ────────────────────────────────────────────
-    for row_cells in data_rows[data_start:]:
-        if not row_cells:
-            continue
-
-        # First cell is the metric name
-        metric = clean_metric_name(row_cells[0])
-        if not metric or len(metric) < 3:
-            continue
-
-        # Skip rows that are section headers (no numeric values)
-        numeric_cells = [parse_value(c) for c in row_cells[1:] if c and c not in ['$', '']]
-        numeric_values = [v for v in numeric_cells if v is not None]
-
-        if not numeric_values:
-            continue
-
-        # Match values to period dates
-        # Filter out empty/dollar-sign cells to get actual values
-        value_cells = [c for c in row_cells[1:] if c and c not in ['$', '', '|']]
-        values = [parse_value(c) for c in value_cells]
-        values = [v for v in values if v is not None]
-
-        for i, (period_date, audited) in enumerate(period_dates):
-            if i < len(values):
-                facts.append({
-                    'ticker': ticker,
-                    'filing_date': filing_date,
-                    'filing_type': filing_type,
-                    'period_date': period_date,
-                    'metric': metric,
-                    'value': values[i],
-                    'audited': audited,
-                    'section': section_name
-                })
+            facts.append({
+                'ticker': ticker,
+                'filing_date': filing_date,
+                'filing_type': filing_type,
+                'period_date': period_date,
+                'statement_type': statement_type,
+                'concept': concept,
+                'label': label,
+                'standard_concept': standard_concept,
+                'value': normalized_value,
+                'unit': normalized_unit,
+                'unit_confidence': unit_confidence,
+            })
 
     return facts
 
 
+def extract_xbrl_financials(filing, ticker, filing_date, filing_type):
+    """Extract all financial statements from XBRL."""
+    try:
+        xbrl = filing.xbrl()
+        statements = xbrl.statements
+    except Exception as e:
+        print(f"    ✗ Could not get XBRL statements: {e}")
+        return []
+
+    all_facts = []
+
+    try:
+        bs = statements.balance_sheet()
+        bs_df = bs.to_dataframe()
+        facts = extract_statement_facts(bs_df, 'balance_sheet', ticker, filing_date, filing_type)
+        all_facts.extend(facts)
+        print(f"      ✓ Balance Sheet: {len(facts)} facts")
+    except Exception as e:
+        print(f"      ✗ Balance Sheet failed: {e}")
+
+    try:
+        inc = statements.income_statement()
+        inc_df = inc.to_dataframe()
+        facts = extract_statement_facts(inc_df, 'income_statement', ticker, filing_date, filing_type)
+        all_facts.extend(facts)
+        print(f"      ✓ Income Statement: {len(facts)} facts")
+    except Exception as e:
+        print(f"      ✗ Income Statement failed: {e}")
+
+    try:
+        cf = statements.cashflow_statement()
+        cf_df = cf.to_dataframe()
+        facts = extract_statement_facts(cf_df, 'cashflow', ticker, filing_date, filing_type)
+        all_facts.extend(facts)
+        print(f"      ✓ Cash Flow: {len(facts)} facts")
+    except Exception as e:
+        print(f"      ✗ Cash Flow failed: {e}")
+
+    return all_facts
+
+
 # ─────────────────────────────────────────────
-# SECTION / NARRATIVE PARSER
+# NARRATIVE TEXT EXTRACTION FOR RAG
 # ─────────────────────────────────────────────
 
-# SEC filing sections we care about for narrative RAG
-NARRATIVE_SECTIONS = {
-    'item 1':  'Business',
-    'item 1a': 'Risk Factors',
-    'item 2':  'Properties',
-    'item 7':  'MD&A',
-    'item 7a': 'Market Risk',
-}
+def is_narrative_section(section_name):
+    """Check if section contains narrative content vs. financial tables."""
+    name_lower = section_name.lower()
 
-TABLE_SECTION_KEYWORDS = [
-    'balance sheet', 'income statement', 'statement of operations',
-    'cash flow', 'stockholders equity', 'shareholders equity',
-    'financial statements', 'financial position'
-]
+    exclude_keywords = [
+        'balance sheet', 'statement of financial position',
+        'income statement', 'statement of operations', 'statement of earnings',
+        'cash flow', 'statement of cash flows',
+        'stockholders equity', 'shareholders equity', 'statement of equity',
+        'statement of comprehensive income',
+        'financial statements', 'consolidated statements',
+        'table of contents', 'index to', 'index of'
+    ]
+
+    if any(kw in name_lower for kw in exclude_keywords):
+        return False
+
+    if any(kw in name_lower for kw in ['cover page', 'signatures', 'exhibits', 'header']):
+        return False
+
+    return True
 
 
-def split_into_sections(markdown_text: str) -> list[dict]:
-    """
-    Split markdown document into sections based on headers.
-    Returns list of {name, content} dicts.
-    """
+def normalize_section_name(section_name):
+    """Normalize verbose/sentence-like headings into stable section buckets."""
+    if not section_name:
+        return 'UNKNOWN'
+
+    raw = re.sub(r'\s+', ' ', section_name.strip())
+    lower = raw.lower()
+
+    if lower in SECTION_CANONICAL_MAP:
+        return SECTION_CANONICAL_MAP[lower]
+
+    for key, canonical in SECTION_CANONICAL_MAP.items():
+        if key in lower:
+            return canonical
+
+    for pattern, canonical in SECTION_PATTERN_RULES:
+        if pattern in lower:
+            return canonical
+
+    if lower.startswith('highlights from the '):
+        return 'Highlights'
+
+    if lower.startswith('risks related to '):
+        tail = raw[len('Risks Related To '):].strip(' :.-')
+        return f"Risk Factors - {tail}" if tail else 'Risk Factors'
+
+    if lower.startswith('note ') and ':' in raw:
+        note_title = raw.split(':', 1)[0].strip()
+        return note_title
+
+    if len(raw) > 120 or raw.startswith(('•', '-', '*')):
+        if 'risk' in lower:
+            return 'Risk Factors'
+        if 'highlight' in lower:
+            return 'Highlights'
+        if 'competition' in lower:
+            return 'Competition'
+        if 'sensitivity' in lower:
+            return 'Sensitivity Analysis'
+        if 'commitment' in lower or 'contingenc' in lower:
+            return 'Commitments and Contingencies'
+        return raw[:80].rstrip(' .:;-')
+
+    if raw.isupper() and any(c.isalpha() for c in raw):
+        return raw.title()
+
+    return raw
+
+
+def split_into_sections(markdown_text):
+    """Split markdown document into sections based on headers."""
     sections = []
     current_section = {'name': 'HEADER', 'content': []}
 
+    def is_noisy_header(header_text):
+        candidate = header_text.strip()
+        if not candidate:
+            return True
+        if candidate.startswith(('•', '-', '*')):
+            return True
+        if len(candidate) > 180:
+            return True
+        if sum(ch.isalpha() for ch in candidate) < 3:
+            return True
+        return False
+
     for line in markdown_text.split('\n'):
-        # Check for section headers (##, ###, ####)
         header_match = re.match(r'^#{1,4}\s+(.+)$', line)
         if header_match:
             header_text = header_match.group(1).strip()
 
-            # Save current section if it has content
+            if is_noisy_header(header_text):
+                current_section['content'].append(line)
+                continue
+
             if current_section['content']:
                 sections.append({
                     'name': current_section['name'],
@@ -339,7 +508,6 @@ def split_into_sections(markdown_text: str) -> list[dict]:
         else:
             current_section['content'].append(line)
 
-    # Don't forget the last section
     if current_section['content']:
         sections.append({
             'name': current_section['name'],
@@ -349,17 +517,8 @@ def split_into_sections(markdown_text: str) -> list[dict]:
     return sections
 
 
-def is_table_section(section_name: str) -> bool:
-    """Determine if a section is primarily financial tables."""
-    name_lower = section_name.lower()
-    return any(kw in name_lower for kw in TABLE_SECTION_KEYWORDS)
-
-
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> list[str]:
-    """
-    Split text into overlapping chunks for embedding.
-    Tries to split on paragraph boundaries.
-    """
+def chunk_text(text, chunk_size=1000, overlap=100):
+    """Split text into overlapping chunks for embedding."""
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     chunks = []
     current_chunk = []
@@ -370,7 +529,6 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> list[st
 
         if current_length + para_length > chunk_size and current_chunk:
             chunks.append('\n\n'.join(current_chunk))
-            # Keep last paragraph for overlap
             current_chunk = current_chunk[-1:] if overlap > 0 else []
             current_length = len(current_chunk[0]) if current_chunk else 0
 
@@ -383,152 +541,150 @@ def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 100) -> list[st
     return chunks
 
 
-def extract_tables_from_section(content: str) -> list[str]:
-    """Extract markdown tables from section content."""
-    tables = []
-    lines = content.split('\n')
-    current_table = []
-    in_table = False
+def extract_narrative_chunks(filing, ticker, filing_date, filing_type):
+    """Extract narrative text chunks from markdown for RAG."""
+    try:
+        markdown = filing.markdown()
+    except Exception as e:
+        print(f"    ✗ Could not get markdown: {e}")
+        return []
 
-    for line in lines:
-        if '|' in line:
-            in_table = True
-            current_table.append(line)
-        else:
-            if in_table and current_table:
-                tables.append('\n'.join(current_table))
-                current_table = []
+    sections = split_into_sections(markdown)
+    all_chunks = []
+
+    for section in sections:
+        section_name = normalize_section_name(section['name'])
+        section_content = section['content']
+
+        if not is_narrative_section(section_name):
+            continue
+
+        if len(section_content) < 200:
+            continue
+
+        lines = section_content.split('\n')
+        narrative_lines = []
+        in_table = False
+
+        for line in lines:
+            if '|' in line:
+                in_table = True
+            elif in_table:
                 in_table = False
+                narrative_lines.append('')
 
-    if current_table:
-        tables.append('\n'.join(current_table))
+            if not in_table:
+                narrative_lines.append(line)
 
-    return tables
+        narrative = '\n'.join(narrative_lines).strip()
 
+        if len(narrative) < 200:
+            continue
 
-def extract_narrative_from_section(content: str) -> str:
-    """Remove tables from section content, keep narrative text."""
-    lines = content.split('\n')
-    narrative_lines = []
-    in_table = False
+        chunks = chunk_text(narrative)
+        if len(chunks) > MAX_CHUNKS_PER_SECTION:
+            chunks = chunks[:MAX_CHUNKS_PER_SECTION]
 
-    for line in lines:
-        if '|' in line:
-            in_table = True
-        elif in_table:
-            in_table = False
-            # Add a blank line after table
-            narrative_lines.append('')
-        
-        if not in_table:
-            narrative_lines.append(line)
+        for i, chunk in enumerate(chunks):
+            all_chunks.append({
+                'ticker': ticker,
+                'filing_date': filing_date,
+                'filing_type': filing_type,
+                'section': section_name,
+                'chunk_index': i,
+                'chunk_text': chunk,
+            })
 
-    return '\n'.join(narrative_lines).strip()
+    return all_chunks
 
 
 # ─────────────────────────────────────────────
 # MAIN PARSING PIPELINE
 # ─────────────────────────────────────────────
 
-def parse_filing(filepath: Path, engine) -> dict:
-    """
-    Parse a single markdown filing.
-    Extracts financial facts and narrative chunks.
-    Returns summary of what was extracted.
-    """
-    ticker, filing_type, filing_date = parse_filename(filepath)
+def parse_company_filings(ticker, engine):
+    """Parse all filings for a company."""
+    print(f"\n{'='*60}")
+    print(f"Processing {ticker}")
+    print('='*60)
 
-    if not filing_date:
-        print(f"  ✗ Could not parse date from {filepath.name}")
-        return {}
+    try:
+        company = Company(ticker)
+    except Exception as e:
+        print(f"✗ Could not fetch company: {e}")
+        return {'ticker': ticker, 'error': str(e)}
 
-    print(f"\n  Processing {ticker} {filing_type} {filing_date}...")
+    total_facts = 0
+    total_chunks = 0
+    filings_processed = 0
 
-    content = filepath.read_text(encoding='utf-8', errors='ignore')
-    sections = split_into_sections(content)
+    for filing_type in FILING_TYPES:
+        try:
+            filings = company.get_filings(form=filing_type).filter(date=f"{START_DATE}:")
+            print(f"\n  Found {len(filings)} {filing_type} filings")
 
-    all_facts = []
-    all_chunks = []
+            for filing in filings:
+                filing_date = filing.filing_date
+                print(f"\n  📄 {filing_type} filed {filing_date}")
 
-    for section in sections:
-        section_name = section['name']
-        section_content = section['content']
+                facts = extract_xbrl_financials(filing, ticker, filing_date, filing_type)
+                chunks = extract_narrative_chunks(filing, ticker, filing_date, filing_type)
+                print(f"      ✓ Narrative: {len(chunks)} chunks")
 
-        # ── Extract financial facts from tables ────────────────────────────
-        tables = extract_tables_from_section(section_content)
-        for table in tables:
-            facts = parse_markdown_table(
-                table, section_name, ticker, filing_date, filing_type
-            )
-            all_facts.extend(facts)
+                saved_facts = 0
+                saved_chunks = 0
 
-        # ── Extract narrative chunks for RAG ──────────────────────────────
-        # Only chunk sections that are narrative (not pure financial tables)
-        if not is_table_section(section_name):
-            narrative = extract_narrative_from_section(section_content)
-            if len(narrative) > 100:  # Skip very short sections
-                chunks = chunk_text(narrative)
-                for i, chunk in enumerate(chunks):
-                    all_chunks.append({
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        INSERT INTO filings (ticker, filing_type, filing_date, accession)
+                        VALUES (:ticker, :filing_type, :filing_date, :accession)
+                        ON CONFLICT (ticker, filing_type, filing_date) DO NOTHING
+                    """), {
                         'ticker': ticker,
-                        'filing_date': filing_date,
                         'filing_type': filing_type,
-                        'section': section_name,
-                        'chunk_index': i,
-                        'chunk_text': chunk,
+                        'filing_date': filing_date,
+                        'accession': filing.accession_number,
                     })
 
-    # ── Save to database ─────────────────────────────────────────────────────
-    facts_saved = 0
-    chunks_saved = 0
+                    for fact in facts:
+                        result = conn.execute(text("""
+                            INSERT INTO financial_facts
+                                (ticker, filing_date, filing_type, period_date, statement_type,
+                                 concept, label, standard_concept, value, unit, unit_confidence)
+                            VALUES
+                                (:ticker, :filing_date, :filing_type, :period_date, :statement_type,
+                                 :concept, :label, :standard_concept, :value, :unit, :unit_confidence)
+                            ON CONFLICT DO NOTHING
+                        """), fact)
+                        saved_facts += result.rowcount or 0
 
-    with engine.connect() as conn:
-        # Register filing
-        conn.execute(text("""
-            INSERT INTO filings (ticker, filing_type, filing_date, file_path)
-            VALUES (:ticker, :filing_type, :filing_date, :file_path)
-            ON CONFLICT (ticker, filing_type, filing_date) DO NOTHING
-        """), {
-            'ticker': ticker,
-            'filing_type': filing_type,
-            'filing_date': filing_date,
-            'file_path': str(filepath)
-        })
+                    for chunk in chunks:
+                        result = conn.execute(text("""
+                            INSERT INTO document_chunks
+                                (ticker, filing_date, filing_type, section, chunk_index, chunk_text)
+                            VALUES
+                                (:ticker, :filing_date, :filing_type, :section, :chunk_index, :chunk_text)
+                            ON CONFLICT DO NOTHING
+                        """), chunk)
+                        saved_chunks += result.rowcount or 0
 
-        # Save financial facts
-        for fact in all_facts:
-            try:
-                conn.execute(text("""
-                    INSERT INTO financial_facts
-                        (ticker, filing_date, filing_type, period_date, metric, value, audited, section)
-                    VALUES
-                        (:ticker, :filing_date, :filing_type, :period_date, :metric, :value, :audited, :section)
-                """), fact)
-                facts_saved += 1
-            except Exception:
-                pass  # Skip duplicates or bad data
+                    conn.commit()
 
-        # Save narrative chunks (embeddings added later)
-        for chunk in all_chunks:
-            try:
-                conn.execute(text("""
-                    INSERT INTO document_chunks
-                        (ticker, filing_date, filing_type, section, chunk_index, chunk_text)
-                    VALUES
-                        (:ticker, :filing_date, :filing_type, :section, :chunk_index, :chunk_text)
-                """), chunk)
-                chunks_saved += 1
-            except Exception:
-                pass
+                total_facts += saved_facts
+                total_chunks += saved_chunks
+                filings_processed += 1
 
-        conn.commit()
+                print(f"      ✓ Saved: {saved_facts} facts, {saved_chunks} chunks")
+
+        except Exception as e:
+            print(f"  ✗ Error processing {filing_type}: {e}")
+            continue
 
     return {
         'ticker': ticker,
-        'filing_type': filing_type,
-        'filing_date': filing_date,
-        'facts_saved': facts_saved,
-        'chunks_saved': chunks_saved
+        'filings_processed': filings_processed,
+        'total_facts': total_facts,
+        'total_chunks': total_chunks,
     }
 
 
@@ -536,36 +692,49 @@ def parse_filing(filepath: Path, engine) -> dict:
 # ENTRY POINT
 # ─────────────────────────────────────────────
 
-def run_parser(data_dir: str = "data/filings"):
-    """Process all markdown filings in the data directory."""
+def run_parser():
+    """Process all companies and their filings."""
     engine = get_engine()
 
     print("Setting up database tables...")
     create_tables(engine)
 
-    filing_path = Path(data_dir)
-    md_files = list(filing_path.rglob("*.md"))
-
-    print(f"\nFound {len(md_files)} filing(s) to process")
-    print("=" * 60)
+    print(f"\n{'='*60}")
+    print("EDGAR XBRL PARSER (HARDENED)")
+    print('='*60)
+    print(f"Companies: {', '.join(TICKERS)}")
+    print(f"Filing types: {', '.join(FILING_TYPES)}")
+    print(f"Date range: {START_DATE} to present")
+    print('='*60)
 
     results = []
-    for filepath in sorted(md_files):
-        result = parse_filing(filepath, engine)
-        if result:
-            results.append(result)
-            print(f"    ✓ Facts: {result['facts_saved']}  Chunks: {result['chunks_saved']}")
+    for ticker in TICKERS:
+        result = parse_company_filings(ticker, engine)
+        results.append(result)
 
     print("\n" + "=" * 60)
     print("PARSING COMPLETE")
     print("=" * 60)
 
-    total_facts = sum(r['facts_saved'] for r in results)
-    total_chunks = sum(r['chunks_saved'] for r in results)
-    print(f"  Total filings processed: {len(results)}")
+    total_filings = sum(r.get('filings_processed', 0) for r in results)
+    total_facts = sum(r.get('total_facts', 0) for r in results)
+    total_chunks = sum(r.get('total_chunks', 0) for r in results)
+
+    print(f"  Total filings processed: {total_filings}")
     print(f"  Total financial facts:   {total_facts}")
     print(f"  Total narrative chunks:  {total_chunks}")
-    print(f"\nNext step: Generate embeddings for {total_chunks} chunks")
+
+    print("\n" + "=" * 60)
+    print("SUMMARY BY COMPANY")
+    print("=" * 60)
+    for r in results:
+        if 'error' in r:
+            print(f"  {r['ticker']:6} ✗ {r['error']}")
+        else:
+            print(
+                f"  {r['ticker']:6} {r['filings_processed']:2} filings  "
+                f"{r['total_facts']:5} facts  {r['total_chunks']:5} chunks"
+            )
 
 
 if __name__ == "__main__":
