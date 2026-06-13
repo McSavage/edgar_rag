@@ -20,8 +20,8 @@ load_dotenv()
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-TICKERS = ["AMZN", "GOOGL", "META", "MSFT", "ORCL"]
-START_DATE = "2023-01-01"
+TICKERS = ["AMZN", "GOOGL", "META", "MSFT", "ORCL", "D"]
+START_DATE = "2020-01-01"
 FILING_TYPES = ["10-K", "10-Q"]
 
 # Set your SEC identity (required)
