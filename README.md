@@ -4,26 +4,26 @@ A hybrid Retrieval-Augmented Generation (RAG) system for analyzing SEC filings u
 
 ## 🎯 Overview
 
-This system provides a natural language interface to analyze SEC filings (10-K and 10-Q reports) for major tech companies. It intelligently routes queries to either structured financial databases or vector-based semantic search depending on the question type, then synthesizes coherent answers using Claude.
+This system provides a natural language interface to analyze SEC filings (10-K and 10-Q reports) for major tech companies and a regulated utility. It intelligently routes queries to either structured financial databases or vector-based semantic search depending on the question type, then synthesizes coherent answers using Claude.
 
 **Current Data Coverage:**
 
-- **Companies:** Amazon (AMZN), Alphabet (GOOGL), Meta (META), Microsoft (MSFT), Oracle (ORCL)
-- **Time Period:** January 2023 - Present
-- **Filings:** 64+ total filings (10-K annual reports and 10-Q quarterly reports)
+- **Companies:** Amazon (AMZN), Alphabet (GOOGL), Meta (META), Microsoft (MSFT), Oracle (ORCL), Dominion Energy (D)
+- **Time Period:** January 2020 - Present
+- **Filings:** 155 total filings (10-K annual reports and 10-Q quarterly reports)
 
 ## ✨ Key Features
 
 ### 1. **Structured Financial Data (XBRL)**
 
-- 10,847+ financial facts extracted from balance sheets, income statements, and cash flow statements
+- 28,685+ financial facts extracted from balance sheets, income statements, and cash flow statements
 - Standardized XBRL concepts for consistent metrics across all companies
 - SQL-queryable database for precise numerical queries with date ranges and filtering
 - Best for: Revenue, expenses, equity, assets, and specific financial metrics
 
 ### 2. **Narrative Content Vector Search**
 
-- 17,730+ text chunks from risk factors, MD&A sections, and business descriptions
+- 26,280+ text chunks from risk factors, MD&A sections, and business descriptions
 - Vector embeddings via Voyage AI for semantic similarity search
 - PostgreSQL with pgvector extension for efficient retrieval
 - Best for: Risks, strategies, qualitative discussions, and business context
@@ -70,7 +70,7 @@ This system provides a natural language interface to analyze SEC filings (10-K a
 ```text
 edgar_rag/
 ├── fetch_filings.py          # Download SEC filings from EDGAR
-├── edgar_parser_v2.py         # Parse XBRL and extract financial facts
+├── edgar_parser.py            # Parse XBRL and extract financial facts
 ├── generate_embeddings.py     # Generate vector embeddings for narrative chunks
 ├── edgar_rag_interface.ipynb  # Main interactive interface
 ├── edgar_data_check.ipynb     # Data validation and statistics
@@ -78,6 +78,7 @@ edgar_rag/
 └── data/
     └── filings/               # Downloaded SEC filings in markdown format
         ├── AMZN/
+        ├── D/
         ├── GOOGL/
         ├── META/
         ├── MSFT/
@@ -155,7 +156,7 @@ Run these scripts in order to set up your data:
 2. **Parse filings and extract financial data:**
 
    ```bash
-   python edgar_parser_v2.py
+   python edgar_parser.py
    ```
 
    Extracts XBRL financial facts and narrative chunks, then loads them into PostgreSQL.
@@ -203,6 +204,7 @@ ask("Show me Amazon's cash flow trends over the past 8 quarters")
 ask("What are the main risks Oracle faces in cloud infrastructure?")
 ask("How does Meta describe its AI strategy?")
 ask("What regulatory concerns are mentioned by these companies?")
+ask("How does Dominion Energy describe data center demand growth in its filings?")
 ```
 
 **Hybrid Analysis:**
@@ -211,6 +213,7 @@ ask("What regulatory concerns are mentioned by these companies?")
 ask("Analyze Amazon's infrastructure investments and related risk factors")
 ask("Compare AI spending and strategic priorities across companies")
 ask("What companies mention energy shortages and how much are they investing?")
+ask("How is Dominion Energy's generation mix changing alongside hyperscaler capex growth?")
 ```
 
 ## 🔧 Configuration
@@ -230,8 +233,8 @@ EMBEDDING_MODEL = "voyage-3"       # 1024 dimensions, higher quality
 In `fetch_filings.py`, customize the companies and time period:
 
 ```python
-TICKERS = ["MSFT", "GOOGL", "AMZN", "META", "ORCL"]
-START_DATE = "2023-01-01"
+TICKERS = ["MSFT", "GOOGL", "AMZN", "META", "ORCL", "D"]
+START_DATE = "2020-01-01"
 ```
 
 ## 📊 Database Schema
@@ -295,4 +298,4 @@ Daniel Savage (<dan.mcsavage@gmail.com>)
 
 ---
 
-**Last Updated:** February 2026
+**Last Updated:** June 2026
