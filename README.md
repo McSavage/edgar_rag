@@ -4,26 +4,26 @@ A hybrid Retrieval-Augmented Generation (RAG) system for analyzing SEC filings u
 
 ## 🎯 Overview
 
-This system provides a natural language interface to analyze SEC filings (10-K and 10-Q reports) for major tech companies and a regulated utility. It intelligently routes queries to either structured financial databases or vector-based semantic search depending on the question type, then synthesizes coherent answers using Claude.
+This system provides a natural language interface to analyze SEC filings (10-K and 10-Q reports) for major tech companies, a regulated utility, and an AI cloud provider. It intelligently routes queries to either structured financial databases or vector-based semantic search depending on the question type, then synthesizes coherent answers using Claude.
 
 **Current Data Coverage:**
 
-- **Companies:** Amazon (AMZN), Alphabet (GOOGL), Meta (META), Microsoft (MSFT), Oracle (ORCL), Dominion Energy (D)
+- **Companies:** Amazon (AMZN), Alphabet (GOOGL), Meta (META), Microsoft (MSFT), Oracle (ORCL), Dominion Energy (D), Coreweave (CRWV)
 - **Time Period:** January 2020 - Present
-- **Filings:** 155 total filings (10-K annual reports and 10-Q quarterly reports)
+- **Filings:** 160 total filings (10-K annual reports and 10-Q quarterly reports)
 
 ## ✨ Key Features
 
 ### 1. **Structured Financial Data (XBRL)**
 
-- 28,685+ financial facts extracted from balance sheets, income statements, and cash flow statements
+- 29,792+ financial facts extracted from balance sheets, income statements, and cash flow statements
 - Standardized XBRL concepts for consistent metrics across all companies
 - SQL-queryable database for precise numerical queries with date ranges and filtering
 - Best for: Revenue, expenses, equity, assets, and specific financial metrics
 
 ### 2. **Narrative Content Vector Search**
 
-- 26,280+ text chunks from risk factors, MD&A sections, and business descriptions
+- 28,491+ text chunks from risk factors, MD&A sections, and business descriptions
 - Vector embeddings via Voyage AI for semantic similarity search
 - PostgreSQL with pgvector extension for efficient retrieval
 - Best for: Risks, strategies, qualitative discussions, and business context
@@ -78,6 +78,7 @@ edgar_rag/
 └── data/
     └── filings/               # Downloaded SEC filings in markdown format
         ├── AMZN/
+        ├── CRWV/
         ├── D/
         ├── GOOGL/
         ├── META/
@@ -233,7 +234,7 @@ EMBEDDING_MODEL = "voyage-3"       # 1024 dimensions, higher quality
 In `fetch_filings.py`, customize the companies and time period:
 
 ```python
-TICKERS = ["MSFT", "GOOGL", "AMZN", "META", "ORCL", "D"]
+TICKERS = ["MSFT", "GOOGL", "AMZN", "META", "ORCL", "D", "CRWV"]
 START_DATE = "2020-01-01"
 ```
 

@@ -20,7 +20,7 @@ load_dotenv()
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-TICKERS = ["AMZN", "GOOGL", "META", "MSFT", "ORCL", "D"]
+TICKERS = ["AMZN", "GOOGL", "META", "MSFT", "ORCL", "D", "CRWV"]
 START_DATE = "2020-01-01"
 FILING_TYPES = ["10-K", "10-Q"]
 

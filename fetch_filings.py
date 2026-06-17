@@ -7,7 +7,7 @@ from pathlib import Path
 set_identity("Daniel Savage dan.mcsavage@gmail.com")
 
 # Your target companies
-TICKERS = ["MSFT", "GOOGL", "AMZN", "META", "ORCL", "D"]
+TICKERS = ["MSFT", "GOOGL", "AMZN", "META", "ORCL", "D", "CRWV"]
 START_DATE = "2020-01-01"
 
 # Create data directory
