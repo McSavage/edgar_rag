@@ -29,6 +29,7 @@ data/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+!edgar_rag_interface.ipynb
 
 # OS
 .DS_Store

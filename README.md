@@ -4,6 +4,8 @@ A hybrid Retrieval-Augmented Generation (RAG) system for analyzing SEC filings u
 
 ## 🎯 Overview
 
+This is a work in progress. The original intent of this project was to support my interest in calculating LCOC - Levelised Cost Of Compute - $/PFLOP-hours for a datacenter. I wasn't optimistic that SEC filings would provide a lot of useful information for that, and this data seems to confirm it. You can see the quality of the results in the `edgar_rag_interface` notebook. I expect to iterate on this a few more times. I thought the exercise of building the data pipeline and infrastructure would be useful in itself.
+
 This system provides a natural language interface to analyze SEC filings (10-K and 10-Q reports) for major tech companies, a regulated utility, and an AI cloud provider. It intelligently routes queries to either structured financial databases or vector-based semantic search depending on the question type, then synthesizes coherent answers using Claude.
 
 **Current Data Coverage:**
@@ -281,13 +283,7 @@ Reference table for company information
 
 ## 🤝 Contributing
 
-Contributions are welcome! Some ideas for improvements:
-
-- Add more companies and sectors
-- Implement caching for common queries
-- Add real-time filing updates
-- Create visualization dashboards
-- Add support for other filing types (8-K, proxy statements)
+I'm not seeking contributions at this time
 
 ## 📄 License
 

@@ -1,7 +1,7 @@
-import os
-from edgar import set_identity, Company
-from datetime import datetime
+"""Download 10-K and 10-Q filings from SEC EDGAR for a fixed list of tickers,
+saving each filing as markdown under data/filings/<TICKER>/."""
 from pathlib import Path
+from edgar import set_identity, Company
 
 # Set identity (required by SEC)
 set_identity("Daniel Savage dan.mcsavage@gmail.com")
