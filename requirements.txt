@@ -1,0 +1,15 @@
+# Pipeline
+edgartools==5.15.0
+SQLAlchemy==2.0.46
+psycopg2-binary==2.9.11
+pandas==3.0.0
+python-dotenv==1.2.1
+tqdm==4.67.3
+voyageai==0.3.7
+
+# Query interface
+anthropic==0.78.0
+
+# Notebook (optional)
+jupyter
+ipykernel

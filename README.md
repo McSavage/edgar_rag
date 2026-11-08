@@ -6,34 +6,35 @@ A hybrid Retrieval-Augmented Generation (RAG) system for analyzing SEC filings u
 
 This is a work in progress. The original intent of this project was to support my interest in calculating LCOC - Levelised Cost Of Compute - $/PFLOP-hours for a datacenter. I wasn't optimistic that SEC filings would provide a lot of useful information for that, and this data seems to confirm it. You can see the quality of the results in the `edgar_rag_interface` notebook. I expect to iterate on this a few more times. I thought the exercise of building the data pipeline and infrastructure would be useful in itself.
 
-This system provides a natural language interface to analyze SEC filings (10-K and 10-Q reports) for major tech companies, a regulated utility, and an AI cloud provider. It intelligently routes queries to either structured financial databases or vector-based semantic search depending on the question type, then synthesizes coherent answers using Claude.
+This system provides a natural language interface to analyze SEC filings (10-K and 10-Q reports) for major tech companies, a regulated utility, an AI cloud provider, and a launch/satellite company. It intelligently routes queries to either structured financial databases or vector-based semantic search depending on the question type, then synthesizes coherent answers using Claude.
 
 **Current Data Coverage:**
 
-- **Companies:** Amazon (AMZN), Alphabet (GOOGL), Meta (META), Microsoft (MSFT), Oracle (ORCL), Dominion Energy (D), Coreweave (CRWV)
-- **Time Period:** January 2020 - Present
-- **Filings:** 160 total filings (10-K annual reports and 10-Q quarterly reports)
+- **Companies:** Amazon (AMZN), Alphabet (GOOGL), Meta (META), Microsoft (MSFT), Oracle (ORCL), Dominion Energy (D), CoreWeave (CRWV), SpaceX (SPCX)
+- **Time Period:** January 2020 - Present (CRWV from its March 2025 IPO, SPCX from its June 2026 IPO)
+- **Filings:** 176 filings (10-K annual reports, 10-Q quarterly reports, and SpaceX's 424B4 IPO prospectus) through October 2026
 
 ## ✨ Key Features
 
 ### 1. **Structured Financial Data (XBRL)**
 
-- 29,792+ financial facts extracted from balance sheets, income statements, and cash flow statements
-- Standardized XBRL concepts for consistent metrics across all companies
+- 41,315 reported financial facts (plus 4,427 derived quarterly values) from balance sheets, income statements, and cash flow statements
+- Every value carries its exact XBRL period (start and end date), classified as a fiscal quarter, fiscal year, year-to-date or balance-sheet date, with fiscal-year/quarter labels that respect non-calendar fiscal years (MSFT: June, ORCL: May)
+- Quarters a filing doesn't report on its own (Q4, and cash-flow quarters, since 10-Qs only report cash flows year-to-date) are derived from year-to-date differences and flagged `is_derived`
 - SQL-queryable database for precise numerical queries with date ranges and filtering
 - Best for: Revenue, expenses, equity, assets, and specific financial metrics
 
 ### 2. **Narrative Content Vector Search**
 
-- 28,491+ text chunks from risk factors, MD&A sections, and business descriptions
+- 40,150 text chunks from risk factors, MD&A sections, and business descriptions
 - Vector embeddings via Voyage AI for semantic similarity search
-- PostgreSQL with pgvector extension for efficient retrieval
+- PostgreSQL with pgvector (HNSW index with filtered iterative scans) for efficient retrieval
 - Best for: Risks, strategies, qualitative discussions, and business context
 
 ### 3. **Intelligent Query Router**
 
-- Claude classifies each query as quantitative, qualitative, or hybrid
-- Automatically retrieves from appropriate data sources
+- Claude classifies each query as quantitative, qualitative, or hybrid, and extracts companies, line-item keywords, quarterly vs. annual granularity and a date window (as structured output)
+- Automatically retrieves from appropriate data sources, balanced per company
 - Synthesizes answers combining numbers with narrative context
 
 ## 🏗️ Architecture
@@ -71,21 +72,18 @@ This system provides a natural language interface to analyze SEC filings (10-K a
 
 ```text
 edgar_rag/
-├── fetch_filings.py          # Download SEC filings from EDGAR
-├── edgar_parser.py            # Parse XBRL and extract financial facts
-├── generate_embeddings.py     # Generate vector embeddings for narrative chunks
-├── edgar_rag_interface.ipynb  # Main interactive interface
-├── edgar_data_check.ipynb     # Data validation and statistics
-├── test_embeddings.ipynb      # Test embedding generation
-└── data/
-    └── filings/               # Downloaded SEC filings in markdown format
-        ├── AMZN/
-        ├── CRWV/
-        ├── D/
-        ├── GOOGL/
-        ├── META/
-        ├── MSFT/
-        └── ORCL/
+├── edgar_rag/                 # the package
+│   ├── config.py              # companies (by CIK), dates, models, identity — the one place to edit
+│   ├── db.py                  # schema + idempotent migrations
+│   ├── sec.py                 # EDGAR access via edgartools
+│   ├── facts.py               # XBRL fact extraction, period classification, derived quarters
+│   ├── narrative.py           # section splitting + chunking for RAG
+│   ├── embeddings.py          # Voyage AI embeddings
+│   ├── ingest.py              # incremental pipeline (update / rebuild-facts / status)
+│   ├── query.py               # router, retrieval, synthesis, ask()
+│   └── __main__.py            # CLI: python -m edgar_rag ...
+├── edgar_rag_interface.ipynb  # interactive interface (thin client over edgar_rag.query)
+└── requirements.txt
 ```
 
 ## 🚀 Setup
@@ -93,7 +91,7 @@ edgar_rag/
 ### Prerequisites
 
 - Python 3.13+
-- PostgreSQL with pgvector extension
+- PostgreSQL 15+ with the pgvector extension (0.8+)
 - API Keys:
   - Anthropic API key (for Claude)
   - Voyage AI API key (for embeddings)
@@ -117,13 +115,12 @@ edgar_rag/
 3. **Install dependencies:**
 
    ```bash
-   pip install edgartools sqlalchemy psycopg2-binary python-dotenv voyageai anthropic tqdm jupyter ipykernel
+   pip install -r requirements.txt
    ```
 
 4. **Set up PostgreSQL:**
 
-   ```bash
-   # Install pgvector extension
+   ```sql
    CREATE EXTENSION vector;
    ```
 
@@ -138,39 +135,37 @@ edgar_rag/
    POSTGRES_HOST=localhost
    POSTGRES_PORT=5432
    POSTGRES_DB=edgar_rag
-   
+
    # API Keys
    ANTHROPIC_API_KEY=your_anthropic_key
    VOYAGE_API_KEY=your_voyage_key
+
+   # SEC requires a "Name email" identity for EDGAR access
+   SEC_IDENTITY="Your Name you@example.com"
+
+   # Optional overrides
+   # CLAUDE_MODEL=claude-sonnet-5-5
+   # EMBEDDING_MODEL=voyage-3-lite
    ```
 
 ### Data Pipeline
 
-Run these scripts in order to set up your data:
+One command creates the schema, finds filings that aren't in the database yet, extracts XBRL facts and narrative chunks, and embeds the new chunks:
 
-1. **Fetch SEC filings:**
+```bash
+python -m edgar_rag update                 # everything new, all companies
+python -m edgar_rag update --tickers SPCX  # one company
+python -m edgar_rag update --dry-run       # list what would be ingested
+python -m edgar_rag status                 # per-company coverage
+```
 
-   ```bash
-   python fetch_filings.py
-   ```
+The pipeline is incremental by accession number, so a refresh after a few months only downloads the new filings. Filings that fail are recorded and retried on the next run. Other commands:
 
-   Downloads 10-K and 10-Q filings from EDGAR and saves them as markdown files in `data/filings/`.
-
-2. **Parse filings and extract financial data:**
-
-   ```bash
-   python edgar_parser.py
-   ```
-
-   Extracts XBRL financial facts and narrative chunks, then loads them into PostgreSQL.
-
-3. **Generate embeddings:**
-
-   ```bash
-   python generate_embeddings.py
-   ```
-
-   Creates vector embeddings for narrative chunks using Voyage AI and stores them in the database.
+```bash
+python -m edgar_rag rebuild-facts   # re-extract XBRL facts for ingested filings (after changing facts.py)
+python -m edgar_rag embed           # embed any chunks still missing embeddings
+python -m edgar_rag ask "What was Microsoft's revenue in fiscal Q2 2025?"
+```
 
 ## 💡 Usage
 
@@ -191,6 +186,8 @@ ask("What risks does Microsoft mention about AI and power?")
 ask("Compare data center spending across the hyperscalers")
 ```
 
+Or from the shell: `python -m edgar_rag ask "..."`.
+
 ### Example Use Cases
 
 **Quantitative Analysis:**
@@ -199,6 +196,7 @@ ask("Compare data center spending across the hyperscalers")
 ask("What was Microsoft's total revenue in Q2 2025?")
 ask("Compare operating expenses between Meta and Alphabet in 2024")
 ask("Show me Amazon's cash flow trends over the past 8 quarters")
+ask("How much did Amazon spend on purchases of property and equipment each quarter of 2025?")
 ```
 
 **Qualitative Analysis:**
@@ -208,6 +206,7 @@ ask("What are the main risks Oracle faces in cloud infrastructure?")
 ask("How does Meta describe its AI strategy?")
 ask("What regulatory concerns are mentioned by these companies?")
 ask("How does Dominion Energy describe data center demand growth in its filings?")
+ask("What does SpaceX say about Starlink and its capital expenditure plans?")
 ```
 
 **Hybrid Analysis:**
@@ -221,65 +220,69 @@ ask("How is Dominion Energy's generation mix changing alongside hyperscaler cape
 
 ## 🔧 Configuration
 
-### Embedding Model
+### Models
 
-In `generate_embeddings.py`, you can configure the embedding model:
+Set in `.env` (defaults in `edgar_rag/config.py`):
 
-```python
-EMBEDDING_MODEL = "voyage-3-lite"  # 512 dimensions, fast & cheap
-# OR
-EMBEDDING_MODEL = "voyage-3"       # 1024 dimensions, higher quality
+```env
+CLAUDE_MODEL=claude-sonnet-5-5   # query routing + answer synthesis
+EMBEDDING_MODEL=voyage-3-lite    # 512 dimensions; voyage-3 = 1024 dimensions
 ```
+
+Changing the embedding model changes the vector dimension; run `python -m edgar_rag embed --reset` to re-embed everything.
 
 ### Companies and Date Range
 
-In `fetch_filings.py`, customize the companies and time period:
+Edit `COMPANIES` and `START_DATE` in `edgar_rag/config.py`. The query router's company list is generated from it, so this is the only place to change:
 
 ```python
-TICKERS = ["MSFT", "GOOGL", "AMZN", "META", "ORCL", "D", "CRWV"]
-START_DATE = "2020-01-01"
+CompanySpec("SPCX", 1181412, "SpaceX", "Space launch and satellite connectivity",
+            ("Space Exploration Technologies", "Starlink"), extra_forms=("424B4",)),
 ```
+
+Companies are looked up by CIK, not ticker. Tickers get reused: `Company("SPCX")` in edgartools resolves to an unrelated ETF trust. Then run `python -m edgar_rag update`.
 
 ## 📊 Database Schema
 
 ### `financial_facts`
 
-Structured financial data from XBRL:
+Structured financial data from XBRL, one row per filing × concept × period × unit:
 
-- Standardized financial metrics
-- Balance sheet, income statement, and cash flow data
-- Period dates and filing dates
+- `concept`, `label` (the company's own line-item label), `value`, `unit` (`USD_millions`, `USD_per_share`, `shares`, `pure`)
+- `period_start` / `period_end` / `duration_days`, `fiscal_period` (`Q`, `6M`, `9M`, `FY`, `TTM`, `instant`), `fiscal_year`, `fiscal_quarter`
+- `is_derived` for quarters computed from year-to-date differences
+- `financial_facts_clean` (view): latest value per company × concept × period, so restatements win
 
 ### `document_chunks`
 
 Narrative content for vector search:
 
-- Text chunks from SEC filings
-- Section types (risk_factors, business, mda)
-- Vector embeddings (512 or 1024 dimensions)
+- Text chunks from SEC filings, linked to `filings` by accession
+- Normalized section names (risk factors, MD&A, business, notes)
+- Vector embeddings (512 or 1024 dimensions), HNSW index
 
 ### `filings`
 
-Metadata about each SEC filing
+One row per filing (keyed by accession), with per-filing ingestion status and counts
 
 ### `companies`
 
-Reference table for company information
+Reference table for company information (CIK, sector, fiscal year end), populated from `config.py`
 
 ## 🎓 Technical Details
 
 - **Embeddings:** Voyage AI (voyage-3-lite with 512 dimensions)
-- **Vector Search:** PostgreSQL + pgvector extension
-- **LLM:** Claude (Anthropic) for query routing and response generation
+- **Vector Search:** PostgreSQL + pgvector (HNSW)
+- **LLM:** Claude Sonnet 5.5 (Anthropic) for query routing (structured outputs) and response generation
 - **Financial Data:** XBRL parsing via edgartools library
-- **Database:** PostgreSQL 14+
+- **Database:** PostgreSQL 15+
 
 ## 📝 Notes
 
-- SEC requires identity for API access (configured in scripts with name/email)
+- SEC requires identity for API access (`SEC_IDENTITY` in `.env`)
 - Voyage AI has batch size limit of 128 texts per API call
 - The system automatically routes queries based on intent classification
-- Financial facts use standardized XBRL concepts for cross-company comparisons
+- Financial facts keep the company's own line-item labels; the same concept can be labelled differently across companies (e.g. capex is "Purchases of property and equipment" at Amazon, "Plant construction and other property additions" at Dominion)
 
 ## 🤝 Contributing
 
@@ -295,4 +298,4 @@ Daniel Savage (<dan.mcsavage@gmail.com>)
 
 ---
 
-**Last Updated:** June 2026
+**Last Updated:** November 2026

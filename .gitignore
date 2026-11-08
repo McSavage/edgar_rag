@@ -18,9 +18,11 @@ env/
 
 # Data files
 data/
+*.dump
 *.pdf
 *.html
 *.txt
+!requirements.txt
 
 # Database
 *.db
