@@ -67,10 +67,11 @@ CREATE TABLE IF NOT EXISTS financial_facts (
     ticker           TEXT NOT NULL,
     filing_type      TEXT NOT NULL,
     filing_date      DATE NOT NULL,
-    statement_type   TEXT NOT NULL,   -- balance_sheet | income_statement | cashflow
+    statement_type   TEXT NOT NULL,   -- balance_sheet | income_statement | cashflow | segment | leases
     concept          TEXT NOT NULL,   -- e.g. us-gaap_PaymentsToAcquirePropertyPlantAndEquipment
-    label            TEXT NOT NULL,   -- company's own line-item label
+    label            TEXT NOT NULL,   -- company's own line-item label (uniform labels for segment/leases)
     standard_concept TEXT,
+    segment          TEXT,            -- business segment (e.g. AWS); NULL = consolidated company
     value            NUMERIC NOT NULL,
     unit             TEXT NOT NULL,   -- USD_millions | USD_per_share | shares | pure | <other measure>
     period_type      TEXT NOT NULL,   -- instant | duration
@@ -84,8 +85,22 @@ CREATE TABLE IF NOT EXISTS financial_facts (
     created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_dedupe ON financial_facts
-    (accession, statement_type, concept, unit, period_start, period_end, is_derived) NULLS NOT DISTINCT;
+    (accession, statement_type, concept, unit, segment, period_start, period_end, is_derived) NULLS NOT DISTINCT;
 CREATE INDEX IF NOT EXISTS idx_facts_lookup ON financial_facts (ticker, concept, period_end);
+
+-- Computed per company after ingest (facts.build_series): maps each reported
+-- statement line item (concept + label) to its series concept, merging tags a
+-- company changed between filings, and to a display label that tells apart
+-- distinct items sharing a label (basic / diluted EPS).
+CREATE TABLE IF NOT EXISTS fact_series (
+    ticker          TEXT NOT NULL,
+    statement_type  TEXT NOT NULL,
+    concept         TEXT NOT NULL,
+    label           TEXT NOT NULL,
+    series_concept  TEXT NOT NULL,
+    series_label    TEXT NOT NULL,
+    PRIMARY KEY (ticker, statement_type, concept, label)
+);
 
 CREATE TABLE IF NOT EXISTS document_chunks (
     id           SERIAL PRIMARY KEY,
@@ -102,21 +117,34 @@ CREATE TABLE IF NOT EXISTS document_chunks (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_dedupe ON document_chunks (accession, section, chunk_index);
 """
 
-# Latest value per (company, concept, unit, exact period): reported beats derived,
-# then the most recent filing wins (so restatements/recasts supersede originals).
+# Latest value per (company, series, unit, segment, exact period): reported beats
+# derived, then the most recent filing wins (so restatements/recasts supersede originals).
+# `concept` is the series concept from fact_series (one per line item even where the
+# company re-tagged it) and `label` adds a qualifier where distinct items share a label;
+# the as-filed values are reported_concept / reported_label.
 # `period_date` is kept as an alias of period_end for older queries.
 CLEAN_VIEW = """
 CREATE OR REPLACE VIEW financial_facts_clean AS
-SELECT DISTINCT ON (ticker, concept, unit, period_start, period_end)
-    ticker, statement_type, concept, label, standard_concept, value, unit,
+WITH f AS (
+    SELECT f.*, f.concept AS reported_concept, f.label AS reported_label,
+           COALESCE(s.series_concept, f.concept) AS series_concept,
+           COALESCE(s.series_label, f.label) AS series_label
+    FROM financial_facts f
+    LEFT JOIN fact_series s
+      ON s.ticker = f.ticker AND s.statement_type = f.statement_type AND s.concept = f.concept
+     AND s.label = f.label
+)
+SELECT DISTINCT ON (ticker, series_concept, unit, segment, period_start, period_end)
+    ticker, statement_type, series_concept AS concept, series_label AS label, standard_concept, value, unit,
     period_type, period_start, period_end, period_end AS period_date, duration_days,
     fiscal_period, fiscal_year, fiscal_quarter, is_derived,
-    filing_type, filing_date, accession
-FROM financial_facts
-ORDER BY ticker, concept, unit, period_start, period_end,
+    filing_type, filing_date, accession, segment, reported_concept, reported_label
+FROM f
+ORDER BY ticker, series_concept, unit, segment, period_start, period_end,
          is_derived ASC,
          filing_date DESC,
-         CASE statement_type WHEN 'income_statement' THEN 0 WHEN 'balance_sheet' THEN 1 ELSE 2 END;
+         CASE statement_type WHEN 'income_statement' THEN 0 WHEN 'balance_sheet' THEN 1 ELSE 2 END,
+         accession DESC;
 """
 
 
@@ -144,6 +172,14 @@ def _migrate_legacy(conn):
             conn.execute(text(f"ALTER INDEX IF EXISTS {old} RENAME TO {old.replace('financial_facts', 'financial_facts_legacy')}"))
         conn.execute(text("ALTER SEQUENCE IF EXISTS financial_facts_id_seq RENAME TO financial_facts_legacy_id_seq"))
         conn.execute(text("UPDATE filings SET facts_status = 'legacy' WHERE facts_status IS NULL"))
+
+    # financial_facts.segment (2026-11): segment facts share concepts with consolidated ones,
+    # so segment joins the dedupe key and the clean view's DISTINCT ON.
+    if _table_exists(conn, "financial_facts") and not _column_exists(conn, "financial_facts", "segment"):
+        print("  Migrating: financial_facts.segment")
+        conn.execute(text("DROP VIEW IF EXISTS financial_facts_clean"))
+        conn.execute(text("ALTER TABLE financial_facts ADD COLUMN segment TEXT"))
+        conn.execute(text("DROP INDEX IF EXISTS idx_facts_dedupe"))  # recreated with segment by SCHEMA
 
     # document_chunks: link to filings by accession.
     if _table_exists(conn, "document_chunks"):

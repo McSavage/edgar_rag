@@ -11,8 +11,19 @@ the balance sheet / income statement / cash flow statement (and their company
 labels); values come from the raw XBRL facts, which carry exact period start and
 end dates and units. Missing discrete quarters (cash-flow statements are YTD-only
 in 10-Qs, and no 10-Q exists for Q4) are then derived as YTD differences.
+
+Beyond the three statements, a few note disclosures matter for AI-infrastructure
+spending and are extracted with uniform labels (statement_type in parentheses):
+- segment facts (segment): revenue, operating income, capex, D&A and assets per
+  business segment, e.g. AWS capex. Read from dimensional facts on the business
+  segments axis.
+- lease facts (leases): right-of-use assets obtained for new leases (leased
+  capacity that never shows up as cash capex), and future payments on leases
+  signed but not yet commenced (the forward data-center pipeline). The latter
+  is tagged differently by every company, hence the per-company rules.
 """
 
+import re
 from datetime import date, timedelta
 
 import pandas as pd
@@ -105,8 +116,54 @@ def _statement_concepts(statements):
     return concepts
 
 
+def _period(f):
+    """(start, end) of a raw fact; start is None for instants."""
+    if f["period_type"] == "instant":
+        instant = f.get("period_instant")
+        return None, pd.to_datetime(f["period_end"] if pd.isna(instant) else instant).date()
+    return pd.to_datetime(f["period_start"]).date(), pd.to_datetime(f["period_end"]).date()
+
+
+class _Rows:
+    """Accumulates fact rows for one filing, dropping exact repeats (facts recur across roles)."""
+
+    def __init__(self, filing, ticker, fye_month, units):
+        self.base = {"accession": filing.accession_number, "ticker": ticker,
+                     "filing_type": filing.form, "filing_date": filing.filing_date}
+        self.fye_month, self.units = fye_month, units
+        self.rows, self.seen = [], set()
+
+    def add(self, f, statement_type, concept, label, standard_concept=None, segment=None, value=None, unit=None):
+        start, end = _period(f)
+        if unit is None:
+            measure = (self.units.get(f["unit_ref"]) or {}).get("measure")
+            value, unit = normalize_unit(f["unit_ref"], measure, concept, float(f["numeric_value"]))
+        key = (statement_type, concept, unit, segment, start, end)
+        if key in self.seen:
+            return False
+        self.seen.add(key)
+        fiscal_period = classify_period(start, end, self.fye_month)
+        fiscal_year, fiscal_quarter = fiscal_labels(end, self.fye_month)
+        self.rows.append({
+            **self.base, "statement_type": statement_type, "concept": concept, "label": label,
+            "standard_concept": standard_concept, "segment": segment, "value": value, "unit": unit,
+            "period_type": "instant" if start is None else "duration",
+            "period_start": start, "period_end": end,
+            "duration_days": None if start is None else (end - start).days + 1,
+            "fiscal_period": fiscal_period, "fiscal_year": fiscal_year,
+            "fiscal_quarter": None if fiscal_period in ("FY", "TTM", "other") else fiscal_quarter,
+            "is_derived": False,
+        })
+        return True
+
+
+def _key(concept):
+    # Raw facts use "us-gaap:Foo"; rendered statements (and the database) use "us-gaap_Foo".
+    return concept.replace(":", "_", 1)
+
+
 def extract_facts(filing, ticker, fye_month):
-    """All non-dimensional facts for primary-statement concepts, with exact periods.
+    """Primary-statement facts plus segment and lease note facts, with exact periods.
 
     Returns (facts, status) where status is 'ok', 'none' (filing has no XBRL) or 'failed'.
     """
@@ -122,57 +179,199 @@ def extract_facts(filing, ticker, fye_month):
     if not concepts:
         return [], "failed"
 
-    facts_df = xbrl.facts.to_dataframe()
-    facts_df = facts_df[~facts_df["is_dimensioned"].astype(bool) & facts_df["numeric_value"].notna()]
-    # Raw facts use "us-gaap:Foo"; rendered statements use "us-gaap_Foo".
-    facts_df = facts_df.assign(concept_key=facts_df["concept"].str.replace(":", "_", n=1))
-    by_concept = {k: g for k, g in facts_df.groupby("concept_key")}
-    units = xbrl.units or {}
-
-    filing_type = filing.form
-    filing_date = filing.filing_date
-    accession = filing.accession_number
-    out, seen = [], set()
+    all_df = xbrl.facts.to_dataframe()
+    all_df = all_df[all_df["numeric_value"].notna()]
+    plain = all_df[~all_df["is_dimensioned"].astype(bool)]
+    by_concept = {_key(k): g for k, g in plain.groupby("concept")}
+    rows = _Rows(filing, ticker, fye_month, xbrl.units or {})
 
     for (statement_type, concept), (label, standard_concept) in concepts.items():
-        group = by_concept.get(concept)
-        if group is None:
+        for _, f in by_concept.get(concept, pd.DataFrame()).iterrows():
+            rows.add(f, statement_type, concept, label, standard_concept)
+
+    statement_concepts = {concept for _, concept in concepts}
+    _add_segment_facts(rows, all_df)
+    _add_lease_flow_facts(rows, by_concept, statement_concepts)
+    _add_lease_commitments(rows, all_df, ticker, balance_date(filing, all_df))
+    return rows.rows, "ok"
+
+
+# ── segment facts ────────────────────────────────────────────
+
+SEGMENT_AXIS = "dim_us-gaap_StatementBusinessSegmentsAxis"
+# The only other axis a segment fact may carry: segment totals are often tagged
+# "Consolidation Items: Operating Segments" (as opposed to eliminations etc.).
+_CONSOLIDATION_AXIS = "dim_srt_ConsolidationItemsAxis"
+_OPERATING_SEGMENTS = "us-gaap:OperatingSegmentsMember"
+
+# Synthetic concept -> (uniform label, candidate XBRL concepts in order of preference).
+# One synthetic concept per line item keeps a series continuous when a company switches
+# tags between years; within a filing the first candidate tagged for a segment/period wins.
+SEGMENT_FACTS = {
+    "edgar_rag_SegmentRevenue": (
+        "Segment revenue",
+        ("us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax", "us-gaap:Revenues")),
+    "edgar_rag_SegmentOperatingIncome": ("Segment operating income", ("us-gaap:OperatingIncomeLoss",)),
+    # Dominion measures segment profit as net income rather than operating income.
+    "edgar_rag_SegmentNetIncome": ("Segment net income", ("us-gaap:NetIncomeLoss",)),
+    "edgar_rag_SegmentCapitalExpenditures": (
+        "Segment capital expenditures",
+        ("us-gaap:SegmentExpenditureAdditionToLongLivedAssets", "us-gaap:PaymentsToAcquirePropertyPlantAndEquipment",
+         "us-gaap:PaymentsForProceedsFromProductiveAssets")),
+    "edgar_rag_SegmentDepreciation": (
+        "Segment depreciation and amortization",
+        ("us-gaap:DepreciationDepletionAndAmortization", "us-gaap:DepreciationAndAmortization", "us-gaap:Depreciation")),
+    "edgar_rag_SegmentAssets": ("Segment assets", ("us-gaap:Assets",)),
+}
+_SEGMENT_NAME = re.compile(r"(?:Statement, Business )?Segments: (.+?)(?=, [^,:]+: |$)")
+
+
+# The same segment under different member labels across filings (keeps one series per segment).
+# Renamed or reorganized segments (e.g. Microsoft's FY2027 segments) are real changes and stay distinct.
+SEGMENT_ALIASES = {
+    "Corporate Segment and Other Operating Segment": "Corporate and Other",
+    "Dominion Energy South Carolina Inc": "Dominion Energy South Carolina",
+    "DESC": "Dominion Energy South Carolina",
+}
+
+
+def segment_name(full_dimension_label):
+    """'Consolidation Items: Operating Segments, Segments: AWS' -> 'AWS'."""
+    m = _SEGMENT_NAME.search(full_dimension_label or "")
+    if not m:
+        return None
+    name = m.group(1).strip()
+    return SEGMENT_ALIASES.get(name, name)
+
+
+def _segment_only(df):
+    """Facts whose only dimension is a business segment (optionally marked as an operating segment)."""
+    if SEGMENT_AXIS not in df.columns:
+        return df.iloc[0:0]
+    other_axes = [c for c in df.columns if c.startswith("dim_") and c not in (SEGMENT_AXIS, _CONSOLIDATION_AXIS)]
+    mask = df[SEGMENT_AXIS].notna() & df[other_axes].isna().all(axis=1)
+    if _CONSOLIDATION_AXIS in df.columns:
+        mask &= df[_CONSOLIDATION_AXIS].isna() | (df[_CONSOLIDATION_AXIS] == _OPERATING_SEGMENTS)
+    return df[mask]
+
+
+def _add_segment_facts(rows, all_df):
+    seg = _segment_only(all_df)
+    if seg.empty:
+        return
+    for concept, (label, candidates) in SEGMENT_FACTS.items():
+        for source in candidates:  # preference order: rows.add drops later duplicates
+            for _, f in seg[seg["concept"] == source].iterrows():
+                name = segment_name(f["full_dimension_label"])
+                if name:
+                    rows.add(f, "segment", concept, label, standard_concept=_key(source), segment=name)
+
+
+# ── lease facts ──────────────────────────────────────────────
+
+LEASE_FLOW_CONCEPTS = {
+    "us-gaap_RightOfUseAssetObtainedInExchangeForFinanceLeaseLiability":
+        "Right-of-use assets obtained for new finance leases",
+    "us-gaap_RightOfUseAssetObtainedInExchangeForOperatingLeaseLiability":
+        "Right-of-use assets obtained for new operating leases",
+}
+
+
+def _add_lease_flow_facts(rows, by_concept, statement_concepts):
+    for concept, label in LEASE_FLOW_CONCEPTS.items():
+        if concept in statement_concepts:  # already captured from the cash flow statement
             continue
-        for _, f in group.iterrows():
-            if f["period_type"] == "instant":
-                instant = f.get("period_instant")
-                end = pd.to_datetime(f["period_end"] if pd.isna(instant) else instant).date()
-                start, days = None, None
-            else:
-                start = pd.to_datetime(f["period_start"]).date()
-                end = pd.to_datetime(f["period_end"]).date()
-                days = (end - start).days + 1
-            measure = (units.get(f["unit_ref"]) or {}).get("measure")
-            value, unit = normalize_unit(f["unit_ref"], measure, concept, float(f["numeric_value"]))
+        for _, f in by_concept.get(concept, pd.DataFrame()).iterrows():
+            rows.add(f, "leases", concept, label)
 
-            key = (statement_type, concept, unit, start, end)
-            if key in seen:  # the same fact is repeated across presentation roles
-                continue
-            seen.add(key)
 
-            fiscal_period = classify_period(start, end, fye_month)
-            fiscal_year, fiscal_quarter = fiscal_labels(end, fye_month)
-            out.append({
-                "accession": accession, "ticker": ticker,
-                "filing_type": filing_type, "filing_date": filing_date,
-                "statement_type": statement_type, "concept": concept, "label": label,
-                "standard_concept": standard_concept, "value": value, "unit": unit,
-                "period_type": "instant" if start is None else "duration",
-                "period_start": start, "period_end": end, "duration_days": days,
-                "fiscal_period": fiscal_period, "fiscal_year": fiscal_year,
-                "fiscal_quarter": None if fiscal_period in ("FY", "TTM", "other") else fiscal_quarter,
-                "is_derived": False,
-            })
-    return out, "ok"
+# Future payments on leases signed but not yet commenced. Every company tags this its own
+# way, and most have changed tags at least once since 2020, so the total for the filing's
+# balance date is taken from the first source that has it:
+#   1. dedicated concepts (amzn:/goog:/fb:/meta:/orcl: ...LeaseNotYetCommenced...), summed
+#      across concepts (Google splits current/non-current, Meta finance/operating);
+#   2. the generic purchase-obligation concept, non-dimensioned, when its label says it is
+#      about leases (Google and Meta 10-Qs);
+#   3. the same concept broken out by a lease member (Amazon, Google, Meta 2024) or by lease
+#      type (Microsoft: finance + operating until mid-2025, then one total tagged twice,
+#      hence distinct values are summed).
+# Stored under one synthetic concept so the clean view dedupes it like any other fact;
+# standard_concept records the tag(s) it was read from.
+LEASES_NOT_COMMENCED_CONCEPT = "edgar_rag_LeasesNotYetCommenced"
+LEASES_NOT_COMMENCED_LABEL = "Leases not yet commenced (future lease payments)"
+_NYC_CONCEPT = re.compile(r"LeaseNotYetCommenced(?:Amount|CurrentAmount|NoncurrentAmount|"
+                          r"FutureMinimumPaymentsDue|LeaseCommitments)$")
+_PURCHASE_OBLIGATION = "us-gaap:UnrecordedUnconditionalPurchaseObligationBalanceSheetAmount"
+_LEASE_TEXT = re.compile(r"not yet commenced|lease commitments|undiscounted lease payments", re.I)
+_LEASE_TYPE_DIM = re.compile(r"^Lease (?:Contractual Term|Arrangement, Type): (?:Finance|Operating) Lease$")
+_NOISE_DIMS = re.compile(r"Subsequent Event|Statistical Measurement", re.I)
+# Companies whose lease member has no lease wording in it.
+_LEASE_MEMBER_OVERRIDES = {"CRWV": re.compile(r"Data Center and Office Buildings", re.I)}
+
+# CoreWeave: MW of power still to be delivered at sites whose lease payments it treats as too
+# uncertain to include in the total above (one large single site plus a group of sites).
+UNDELIVERED_POWER_CONCEPT = "crwv:ElectricalPowerAccessNotYetCommenced"
+UNDELIVERED_POWER_LABEL = "Undelivered contracted power at leased data center sites"
+
+
+def _instants(df):
+    return pd.to_datetime(df["period_instant"], errors="coerce")
+
+
+def balance_date(filing, df):
+    """The filing's balance-sheet date: period_of_report, else the most common instant."""
+    try:
+        return pd.to_datetime(filing.period_of_report).date()
+    except (AttributeError, TypeError, ValueError):
+        instants = _instants(df).dropna()
+        return instants.mode().iloc[0].date() if not instants.empty else None
+
+
+def leases_not_commenced(df, as_of, ticker=None):
+    """(total USD, source concepts) for leases not yet commenced at `as_of`, or None."""
+    dims = df["full_dimension_label"].fillna("")
+    df = df[(_instants(df) == pd.Timestamp(as_of)) & df["numeric_value"].notna() & ~dims.str.contains(_NOISE_DIMS)]
+    dims = df["full_dimension_label"].fillna("")
+    plain = dims == ""
+
+    dedicated = df[plain & df["concept"].str.contains(_NYC_CONCEPT)].drop_duplicates("concept")
+    if not dedicated.empty:
+        return float(dedicated["numeric_value"].sum()), sorted(dedicated["concept"])
+
+    po = df["concept"] == _PURCHASE_OBLIGATION
+    labelled = df[po & plain & df["label"].fillna("").str.contains(_LEASE_TEXT)]
+    if not labelled.empty:
+        return float(labelled["numeric_value"].max()), [_PURCHASE_OBLIGATION]
+
+    member = _LEASE_MEMBER_OVERRIDES.get(ticker)
+    if member is not None:
+        by_member = dims.str.contains(member)
+    else:
+        by_member = dims.str.contains(_LEASE_TEXT) | dims.str.match(_LEASE_TYPE_DIM)
+    broken_out = df[po & ~plain & by_member]
+    if not broken_out.empty:
+        return float(broken_out["numeric_value"].drop_duplicates().sum()), [_PURCHASE_OBLIGATION]
+    return None
+
+
+def _add_lease_commitments(rows, all_df, ticker, as_of):
+    if as_of is None:
+        return
+    found = leases_not_commenced(all_df, as_of, ticker)
+    at_date = all_df[_instants(all_df) == pd.Timestamp(as_of)]
+    if found:
+        value, sources = found
+        rows.add(at_date.iloc[0], "leases", LEASES_NOT_COMMENCED_CONCEPT, LEASES_NOT_COMMENCED_LABEL,
+                 standard_concept=", ".join(_key(s) for s in sources), value=value / 1_000_000, unit="USD_millions")
+    power = at_date[(at_date["concept"] == UNDELIVERED_POWER_CONCEPT)
+                    & ~at_date["full_dimension_label"].fillna("").str.contains(_NOISE_DIMS)]
+    if not power.empty:
+        rows.add(power.iloc[0], "leases", _key(UNDELIVERED_POWER_CONCEPT), UNDELIVERED_POWER_LABEL,
+                 value=float(power["numeric_value"].drop_duplicates().sum()), unit="MW")
 
 
 FACT_COLUMNS = ["accession", "ticker", "filing_type", "filing_date", "statement_type", "concept",
-                "label", "standard_concept", "value", "unit", "period_type", "period_start",
+                "label", "standard_concept", "segment", "value", "unit", "period_type", "period_start",
                 "period_end", "duration_days", "fiscal_period", "fiscal_year", "fiscal_quarter",
                 "is_derived"]
 
@@ -193,17 +392,19 @@ def derive_quarters(clean_rows, fye_month):
     by_key = {}
     reported_quarters = set()
     for r in clean_rows:
-        by_key[(r["concept"], r["unit"], r["period_start"], r["fiscal_period"])] = r
+        series = (r["concept"], r["unit"], r.get("segment"))
+        by_key[(*series, r["period_start"], r["fiscal_period"])] = r
         if r["fiscal_period"] == "Q":
-            reported_quarters.add((r["concept"], r["unit"], r["period_end"]))
+            reported_quarters.add((*series, r["period_end"]))
 
     derived = []
     for r in clean_rows:
         shorter = _YTD_STEPS.get(r["fiscal_period"])
         if not shorter:
             continue
-        prev = by_key.get((r["concept"], r["unit"], r["period_start"], shorter))
-        if prev is None or (r["concept"], r["unit"], r["period_end"]) in reported_quarters:
+        series = (r["concept"], r["unit"], r.get("segment"))
+        prev = by_key.get((*series, r["period_start"], shorter))
+        if prev is None or (*series, r["period_end"]) in reported_quarters:
             continue
         start = prev["period_end"] + timedelta(days=1)
         days = (r["period_end"] - start).days + 1
@@ -213,9 +414,154 @@ def derive_quarters(clean_rows, fye_month):
         derived.append({
             **{k: r[k] for k in ("accession", "ticker", "filing_type", "filing_date", "statement_type",
                                  "concept", "label", "standard_concept", "unit")},
+            "segment": r.get("segment"),
             "value": float(r["value"]) - float(prev["value"]),
             "period_type": "duration", "period_start": start, "period_end": r["period_end"],
             "duration_days": days, "fiscal_period": "Q",
             "fiscal_year": fiscal_year, "fiscal_quarter": fiscal_quarter, "is_derived": True,
         })
     return derived
+
+
+# ── series: one concept per line item ────────────────────────
+
+# Companies re-tag line items between filings (fb_ -> meta_, a custom tag -> the
+# us-gaap one, a taxonomy update), and a newer filing's comparative columns use
+# the new tag for periods already stored under the old one, so the clean view
+# showed the same value twice. Separately, distinct items can share a label
+# (Oracle "Services" revenue and expense, basic and diluted EPS), which reads as
+# a duplicate once the concept name is dropped. build_series maps each reported
+# (statement, concept, label) to a series concept and display label fixing both.
+
+SERIES_STATEMENTS = ("balance_sheet", "income_statement", "cashflow")
+
+
+def norm_label(label):
+    """Label for matching: no parentheticals ("(loss)", "(Note 12)"), punctuation or case."""
+    label = re.sub(r"\([^)]*\)", " ", label.replace("’", "'").lower())
+    return " ".join(re.findall(r"[a-z0-9&']+", label))
+
+
+_FILLER = {"and", "of", "the", "in", "for", "from", "to", "net", "other", "a", "on", "by", "total"}
+
+
+def _similar(a, b):
+    """Normalised labels that plausibly name the same item (wording drift between filings)."""
+    ta, tb = set(a.split()) - _FILLER, set(b.split()) - _FILLER
+    if not ta or not tb:
+        return True
+    return len(ta & tb) / min(len(ta), len(tb)) >= 0.5
+
+
+def _concept_words(concept):
+    local = re.sub(r"\d+$", "", concept.split("_", 1)[-1])
+    # Some company tags lower-case the joining words (goog_PropertyPlantandEquipment...).
+    local = re.sub(r"(?<=[a-z])(and|of|for|in|to|after)(?=[A-Z])", lambda m: m.group(1).title(), local)
+    return re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", local)
+
+
+def _qualifiers(concepts):
+    """Short suffixes telling apart concepts that share a label: the words of each
+    concept name that are not common to all of them ("basic" / "diluted")."""
+    words = {c: _concept_words(c) for c in concepts}
+    common = set.intersection(*(set(w) for w in words.values()))
+    quals = {c: " ".join(w for w in words[c] if w not in common).lower() for c in concepts}
+    if len(set(quals.values())) < len(quals) or not all(quals.values()):
+        quals = {c: " ".join(words[c]).lower() for c in concepts}
+    if len(set(quals.values())) < len(quals):
+        quals = {c: c for c in concepts}
+    return quals
+
+
+def build_series(rows):
+    """Map reported statement facts of one company to continuous series.
+
+    rows: dicts with accession, filing_date, statement_type, concept, label, unit,
+    period_start, period_end, value (reported, consolidated statement facts).
+    Returns {(statement_type, concept, label): (series_concept, display_label)}.
+
+    Two concepts are one re-tagged line item when they were used with the same
+    label, never report the same period in the same filing (side-by-side items
+    such as basic and diluted EPS always do), and report the same non-zero value
+    for that label for at least one period (the comparative column of the first
+    filing with the new tag). The merged item takes the most recently used
+    concept. A concept whose labels are unrelated (a generic tag reused for
+    different line items, e.g. Dominion's ProceedsFromSaleOfProductiveAssets)
+    only moves the rows with the matching label; otherwise label wording drift
+    stays within one series. Distinct items still sharing a label and unit in
+    one statement get a qualifier from their concept names.
+    """
+    items, slots = {}, {}
+    for r in rows:
+        st = r["statement_type"]
+        if st not in SERIES_STATEMENTS:
+            continue
+        k = (st, r["concept"], norm_label(r["label"]))
+        i = items.setdefault(k, {"vals": set(), "units": set(), "labels": set(), "latest": (date.min, "")})
+        i["labels"].add(r["label"])
+        i["units"].add(r["unit"])
+        if float(r["value"]) != 0:
+            i["vals"].add((r["unit"], r["period_start"], r["period_end"], round(float(r["value"]), 4)))
+        i["latest"] = max(i["latest"], (r["filing_date"], r["accession"]))
+        slots.setdefault((st, r["concept"]), set()).add(
+            (r["accession"], r["unit"], r["period_start"], r["period_end"]))
+
+    # Start with one group per concept, or per label for a reused generic concept.
+    by_concept = {}
+    for k in items:
+        by_concept.setdefault(k[:2], []).append(k)
+    group = {}
+    for ks in by_concept.values():
+        labels = [k[2] for k in ks]
+        reused = any(not _similar(a, b) for n, a in enumerate(labels) for b in labels[n + 1:])
+        for members in ([frozenset([k]) for k in ks] if reused else [frozenset(ks)]):
+            for k in members:
+                group[k] = members
+
+    # Merge, strongest evidence first, never joining two groups whose concepts
+    # reported the same period in one filing (or two label groups of one concept).
+    by_label = {}
+    for k in items:
+        by_label.setdefault((k[0], k[2]), []).append(k)
+    scored = []
+    for ks in by_label.values():
+        ks.sort()
+        for n, a in enumerate(ks):
+            for b in ks[n + 1:]:
+                shared = len(items[a]["vals"] & items[b]["vals"])
+                if shared:
+                    scored.append((shared, a, b))
+    for _, a, b in sorted(scored, reverse=True):
+        ga, gb = group[a], group[b]
+        if ga == gb:
+            continue
+        concepts_a, concepts_b = {k[:2] for k in ga}, {k[:2] for k in gb}
+        if set().union(*(slots[c] for c in concepts_a)) & set().union(*(slots[c] for c in concepts_b)):
+            continue
+        merged = ga | gb
+        for k in merged:
+            group[k] = merged
+
+    series = {}
+    for members in set(group.values()):
+        head = max(members, key=lambda k: items[k]["latest"])[1]
+        for k in members:
+            series[k] = head
+
+    # Distinct series still sharing a label and unit within one statement.
+    clash = {}
+    for (st, concept, label), head in series.items():
+        for unit in items[(st, concept, label)]["units"]:
+            clash.setdefault((st, label, unit), set()).add(head)
+    qualifier = {}
+    for (st, label, _), heads in clash.items():
+        if len(heads) > 1:
+            for c, q in _qualifiers(sorted(heads)).items():
+                qualifier[(st, label, c)] = q
+
+    out = {}
+    for (st, concept, label), head in series.items():
+        q = qualifier.get((st, label, head))
+        for raw in items[(st, concept, label)]["labels"]:
+            out[(st, concept, raw)] = (head, f"{raw} ({q})" if q else raw)
+    return out

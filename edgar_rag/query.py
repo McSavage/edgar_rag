@@ -61,14 +61,31 @@ def fiscal_year_ends():
     return {t: m for t, m in rows if m}
 
 
+@lru_cache(maxsize=1)
+def segment_names():
+    """{ticker: [segment, ...]} reported since 2024, latest first (older names were reorganized away)."""
+    with db.get_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT ticker, segment FROM financial_facts_clean
+            WHERE segment IS NOT NULL AND period_end >= '2024-01-01'
+            GROUP BY ticker, segment ORDER BY ticker, max(period_end) DESC, segment
+        """)).fetchall()
+    out = {}
+    for ticker, segment in rows:
+        out.setdefault(ticker, []).append(segment)
+    return out
+
+
 def _company_lines():
     months = fiscal_year_ends()
+    segments = segment_names()
     lines = []
     for c in config.COMPANIES:
         names = ", ".join((c.name, *c.aliases))
         fye = months.get(c.ticker)
         fy_note = "" if fye in (None, 12) else f"; fiscal year ends {date(2000, fye, 1):%B}"
-        lines.append(f"- {c.ticker}: {names} ({c.sector}{fy_note})")
+        seg_note = f"; segments: {', '.join(segments[c.ticker])}" if segments.get(c.ticker) else ""
+        lines.append(f"- {c.ticker}: {names} ({c.sector}{fy_note}{seg_note})")
     return "\n".join(lines)
 
 
@@ -83,12 +100,14 @@ ROUTER_SCHEMA = {
             "tickers": {"type": "array", "items": {"type": "string", "enum": config.TICKERS}},
             "sql_keywords": {"type": "array", "items": {"type": "string"}},
             "period_granularity": {"type": "string", "enum": ["quarterly", "annual", "any"]},
+            "include_segments": {"type": "boolean"},
+            "segment_filter": {"type": "array", "items": {"type": "string"}},
             "date_start": {"type": "string"},
             "date_end": {"type": "string"},
             "narrative_search_query": {"type": "string"},
         },
-        "required": ["query_type", "tickers", "sql_keywords", "period_granularity",
-                     "date_start", "date_end", "narrative_search_query"],
+        "required": ["query_type", "tickers", "sql_keywords", "period_granularity", "include_segments",
+                     "segment_filter", "date_start", "date_end", "narrative_search_query"],
         "additionalProperties": False,
     },
 }
@@ -112,12 +131,28 @@ or a balance-sheet date. Example line-item labels (use them to write precise sql
 - "Long-term debt", "Total liabilities", "Total stockholders equity"
 - "Depreciation and amortization", "Stock-based compensation"
 
+Beyond the three statements, two note disclosures are stored with uniform labels:
+- Business segments (only searched when include_segments is true): "Segment revenue", "Segment operating income",
+  "Segment net income", "Segment capital expenditures", "Segment depreciation and amortization", "Segment assets".
+  Segment capex exists for Amazon (AWS, North America, International; quarterly) and Dominion (Dominion Energy
+  Virginia, Dominion Energy South Carolina, Contracted Energy; annual). Microsoft (e.g. Intelligent Cloud),
+  Alphabet (Google Cloud, Google Services), Meta, Oracle and SpaceX have segment revenue / operating income only.
+- Leases: "Leases not yet commenced" (future payments on signed, mostly data-center, leases that have not started:
+  the forward build-out pipeline, a balance-date value), "Right-of-use assets obtained for new finance leases" and
+  "... new operating leases" (leased capacity added in the period, which cash capex does not include), and for
+  CoreWeave "Undelivered contracted power" (MW). For questions about total infrastructure spending, commitments
+  or the data-center pipeline, add lease keywords next to the capex label.
+
 Fields:
 - query_type: "quantitative" for numbers/metrics, "qualitative" for risks/strategy/narrative, "both" for combined.
 - tickers: every company the question mentions, mapped to its ticker. Empty list if none (searches all).
 - sql_keywords: 2-5 phrases that would match line-item labels via SQL ILIKE. No apostrophes.
 - period_granularity: "quarterly" if the question is about quarters or quarterly trends, "annual" if about
   years or fiscal years, otherwise "any".
+- include_segments: true if the question is about a business segment (AWS, Google Cloud, Intelligent Cloud,
+  Dominion Energy Virginia, ...) or asks for a segment breakdown; otherwise false (company totals only).
+- segment_filter: when the question singles out particular segments, their exact names from the company list
+  above (e.g. ["AWS"] for Amazon Web Services); [] for every segment. Company totals are always included.
 - date_start / date_end: YYYY-MM-DD bounds on the period end date if the question implies a time window
   (e.g. "last 2 years"), else "". Today is {today}. For a company with a non-calendar fiscal year, a quarter
   or year like "Q2 2025" is ambiguous: make the window cover both the fiscal and the calendar reading
@@ -126,7 +161,8 @@ Fields:
   "" if purely quantitative."""
 
 _FALLBACK_ANALYSIS = {"query_type": "both", "tickers": [], "sql_keywords": ["revenue", "income"],
-                      "period_granularity": "any", "date_start": "", "date_end": ""}
+                      "period_granularity": "any", "include_segments": False, "segment_filter": [],
+                      "date_start": "", "date_end": ""}
 
 
 def analyze_query(question):
@@ -149,18 +185,30 @@ _GRANULARITY_FILTER = {
 }
 
 
-def search_financial_facts(keywords, tickers=None, date_start="", date_end="", granularity="any", limit=20):
-    """Keyword search over financial_facts_clean, balanced per ticker."""
+def search_financial_facts(keywords, tickers=None, date_start="", date_end="", granularity="any", limit=20,
+                           segments=False, segment_filter=()):
+    """Keyword search over financial_facts_clean, balanced per ticker.
+
+    segments=False searches company totals only; True also searches business-segment facts,
+    restricted to `segment_filter` names (substring match) when given.
+    """
     if not keywords:
         return pd.DataFrame()
     params, conditions = {}, []
     for i, kw in enumerate(keywords[:8]):
         # DB labels use U+2019 apostrophes; strip both sides so "stockholders" matches "stockholders’".
-        conditions.append(f"(REPLACE(REPLACE(label, E'\\u2019', ''), '''', '') ILIKE :kw{i} OR concept ILIKE :kw{i})")
+        conditions.append(f"(REPLACE(REPLACE(label, E'\\u2019', ''), '''', '') ILIKE :kw{i} "
+                          f"OR concept ILIKE :kw{i} OR reported_concept ILIKE :kw{i})")
         # Words in order with anything between, so "Purchases of property and equipment" also
         # matches "Purchases of property, plant, and equipment".
         params[f"kw{i}"] = "%" + "%".join(kw.split()) + "%"
     where = [f"({' OR '.join(conditions)})", _GRANULARITY_FILTER.get(granularity, _GRANULARITY_FILTER["any"])]
+    if not segments:
+        where.append("segment IS NULL")
+    elif segment_filter:
+        names = [f"segment ILIKE :seg{i}" for i in range(len(segment_filter))]
+        where.append(f"(segment IS NULL OR {' OR '.join(names)})")
+        params.update({f"seg{i}": f"%{name}%" for i, name in enumerate(segment_filter)})
     if date_start:
         where.append("period_end >= :date_start")
         params["date_start"] = date_start
@@ -168,19 +216,23 @@ def search_financial_facts(keywords, tickers=None, date_start="", date_end="", g
         where.append("period_end <= :date_end")
         params["date_end"] = date_end
     # Breadth first: the latest value of every matching line item, then the next-latest, ...
-    # (sorting by label alone let alphabetically early labels crowd out e.g. capex).
+    # (sorting by label alone let alphabetically early labels crowd out e.g. capex). A line
+    # item is its series concept, so one whose label wording changed is still one item.
     sql = f"""
         SELECT ticker, fiscal_year, fiscal_quarter, fiscal_period, period_start, period_end,
-               statement_type, label, value, unit, is_derived, filing_type, filing_date
+               statement_type, label, segment, value, unit, is_derived, filing_type, filing_date
         FROM (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY label, unit, fiscal_period ORDER BY period_end DESC) AS rn
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY concept, segment, unit, fiscal_period
+                                         ORDER BY period_end DESC) AS rn
             FROM financial_facts_clean
             WHERE {' AND '.join(where)} AND ticker = :ticker
         ) ranked
-        ORDER BY rn, label
+        ORDER BY rn, label, segment
         LIMIT :limit
     """
     per_ticker = limit * 3 if (date_start or date_end) else limit
+    if segments:  # each segment repeats every line item
+        per_ticker *= 2 if segment_filter else 3
     frames = []
     with db.get_engine().connect() as conn:
         for ticker in (tickers or config.TICKERS):
@@ -192,7 +244,8 @@ def search_financial_facts(keywords, tickers=None, date_start="", date_end="", g
     out = pd.concat(frames, ignore_index=True)
     if not tickers:  # "all companies": keep the overall result size bounded
         out = out.groupby("ticker", group_keys=False).head(max(5, limit // 2))
-    return out.sort_values(["ticker", "label", "period_end"], ascending=[True, True, False]).reset_index(drop=True)
+    return out.sort_values(["ticker", "label", "segment", "period_end"], ascending=[True, True, True, False],
+                           na_position="first").reset_index(drop=True)
 
 
 # ── retrieval: narrative ─────────────────────────────────────
@@ -265,7 +318,8 @@ def build_context(data):
             parts.append(f"\n## {ticker}\n")
             for _, r in rows.iterrows():
                 derived = " [derived: full-period total minus year-to-date]" if r["is_derived"] else ""
-                parts.append(f"- {r['label']}: {format_value(r['value'], r['unit'])} — {format_period(r)} "
+                segment = f" [segment: {r['segment']}]" if isinstance(r.get("segment"), str) else ""
+                parts.append(f"- {r['label']}{segment}: {format_value(r['value'], r['unit'])} — {format_period(r)} "
                              f"[latest reported in {r['filing_type']} filed {r['filing_date']}]{derived}\n")
     nar = data.get("narrative_data")
     if nar is not None and not nar.empty:
@@ -283,6 +337,8 @@ Question: {question}
 Fiscal years: {fiscal_note}. Quarter labels (e.g. "FY2025 Q2") are fiscal quarters; the calendar dates are given with each value.
 Values marked "derived" were computed from reported figures (e.g. Q4 = full year minus nine months) because the filing does not report that quarter on its own.
 Each value is the most recently reported figure for its period, so restatements win; the cited filing is often a later one that shows the period as a prior-year comparative. That is expected, not an inconsistency.
+Values marked with a segment belong to that business segment only; unmarked values are company totals. Segment capex can include assets acquired under finance leases, so it need not sum to the cash capex line.
+"Leases not yet commenced" is the total undiscounted payments over the full term (often 15-20 years) of leases signed but not started as of that date: a measure of committed future capacity, not spending in any one period. "Right-of-use assets obtained for new leases" is leased capacity added in the period, which the cash capex line does not include.
 
 Retrieved data:
 {context}
@@ -316,7 +372,7 @@ def query_edgar(question, max_financial_results=20, max_narrative_results=5, syn
     log(f"\n{'=' * 60}\nQUERY: {question}\n{'=' * 60}")
     a = analyze_query(question)
     log(f"\nQuery type: {a['query_type']}\nTickers: {a['tickers'] or 'all'}\nSQL keywords: {a['sql_keywords']}"
-        f"\nGranularity: {a['period_granularity']}")
+        f"\nGranularity: {a['period_granularity']}" + (f"\nSegments: {', '.join(a.get('segment_filter') or []) or 'all'}" if a.get("include_segments") else ""))
     if a["date_start"] or a["date_end"]:
         log(f"Date range: {a['date_start'] or '…'} to {a['date_end'] or '…'}")
     if a["narrative_search_query"]:
@@ -327,7 +383,8 @@ def query_edgar(question, max_financial_results=20, max_narrative_results=5, syn
         log("\n🔢 Searching financial facts...")
         results["financial_data"] = search_financial_facts(
             a["sql_keywords"], a["tickers"], a["date_start"], a["date_end"], a["period_granularity"],
-            max_financial_results)
+            max_financial_results, segments=a.get("include_segments", False),
+            segment_filter=a.get("segment_filter") or ())
         log(f"   Found {len(results['financial_data'])} financial facts")
     if a["query_type"] in ("qualitative", "both"):
         log("\n📄 Searching narrative chunks...")

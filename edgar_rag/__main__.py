@@ -2,6 +2,7 @@
 
     python -m edgar_rag update [--tickers SPCX MSFT] [--dry-run] [--no-embed]
     python -m edgar_rag rebuild-facts [--tickers ...]
+    python -m edgar_rag rebuild-series [--tickers ...]
     python -m edgar_rag embed [--reset]
     python -m edgar_rag status
     python -m edgar_rag migrate
@@ -26,6 +27,9 @@ def main():
     p = sub.add_parser("rebuild-facts", help="re-extract XBRL facts for already-ingested filings")
     p.add_argument("--tickers", nargs="+")
 
+    p = sub.add_parser("rebuild-series", help="recompute series mappings and derived quarters from stored facts")
+    p.add_argument("--tickers", nargs="+")
+
     p = sub.add_parser("embed", help="embed chunks that have no embedding")
     p.add_argument("--reset", action="store_true", help="discard ALL embeddings and re-embed (model change)")
 
@@ -45,6 +49,8 @@ def main():
         ingest.rebuild_facts(args.tickers)
         print()
         ingest.status()
+    elif args.command == "rebuild-series":
+        ingest.rebuild_series(args.tickers)
     elif args.command == "embed":
         embeddings.embed_pending(reset=args.reset)
     elif args.command == "status":

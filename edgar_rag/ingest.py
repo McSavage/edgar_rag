@@ -84,12 +84,36 @@ def process_filing(filing, spec, fye, do_facts=True, do_chunks=True):
                           "WHERE accession = :accession"), {**fields, "accession": filing.accession_number})
 
 
+def build_series(conn, spec):
+    rows = conn.execute(text("""
+        SELECT accession, filing_date, statement_type, concept, label, unit, period_start, period_end, value
+        FROM financial_facts
+        WHERE ticker = :t AND NOT is_derived AND segment IS NULL AND statement_type = ANY(:st)
+    """), {"t": spec.ticker, "st": list(facts.SERIES_STATEMENTS)}).mappings().all()
+    series = facts.build_series(rows)
+    conn.execute(text("DELETE FROM fact_series WHERE ticker = :t"), {"t": spec.ticker})
+    db.bulk_insert(conn, "fact_series",
+                   [{"ticker": spec.ticker, "statement_type": st, "concept": c, "label": lab,
+                     "series_concept": sc, "series_label": sl} for (st, c, lab), (sc, sl) in series.items()],
+                   ["ticker", "statement_type", "concept", "label", "series_concept", "series_label"])
+    merged = sum(1 for (_, c, _), (sc, _) in series.items() if c != sc)
+    qualified = sum(1 for (_, _, lab), (_, sl) in series.items() if lab != sl)
+    print(f"  ✓ {spec.ticker}: {len(series)} statement line items, {merged} mapped to a re-tagged "
+          f"concept, {qualified} labels qualified")
+
+
+def finalize(conn, spec, fye):
+    """Company-level steps after its filings change: series mapping, then derived quarters."""
+    build_series(conn, spec)
+    derive_quarters(conn, spec, fye)
+
+
 def derive_quarters(conn, spec, fye):
     conn.execute(text("DELETE FROM financial_facts WHERE ticker = :t AND is_derived"), {"t": spec.ticker})
     rows = conn.execute(text("""
         SELECT * FROM financial_facts_clean
         WHERE ticker = :t AND unit = 'USD_millions' AND period_type = 'duration'
-          AND statement_type IN ('income_statement', 'cashflow')
+          AND statement_type IN ('income_statement', 'cashflow', 'segment', 'leases')
     """), {"t": spec.ticker}).mappings().all()
     derived = facts.derive_quarters([dict(r) for r in rows], fye)
     n = db.bulk_insert(conn, "financial_facts", derived, facts.FACT_COLUMNS)
@@ -133,7 +157,7 @@ def update(tickers=None, dry_run=False, embed=True):
                                  chunks_status="failed" if do_chunks else prev_chunks)
         if todo:
             with db.get_engine().begin() as conn:
-                derive_quarters(conn, spec, fye)
+                finalize(conn, spec, fye)
     if embed and not dry_run:
         print()
         embeddings.embed_pending()
@@ -157,7 +181,17 @@ def rebuild_facts(tickers=None):
                         conn.execute(text("UPDATE filings SET facts_status = 'failed', error = :e WHERE accession = :a"),
                                      {"e": str(e)[:2000], "a": f.accession_number})
         with db.get_engine().begin() as conn:
-            derive_quarters(conn, spec, fye)
+            finalize(conn, spec, fye)
+
+
+def rebuild_series(tickers=None):
+    """Recompute series mappings and derived quarters from stored facts (no downloads)."""
+    db.migrate()
+    for spec in _select(tickers):
+        with db.get_engine().begin() as conn:
+            fye = conn.execute(text("SELECT fiscal_year_end_month FROM companies WHERE ticker = :t"),
+                               {"t": spec.ticker}).scalar() or _fye(conn, spec)
+            finalize(conn, spec, fye)
 
 
 def status():

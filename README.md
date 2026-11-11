@@ -18,9 +18,12 @@ This system provides a natural language interface to analyze SEC filings (10-K a
 
 ### 1. **Structured Financial Data (XBRL)**
 
-- 41,315 reported financial facts (plus 4,427 derived quarterly values) from balance sheets, income statements, and cash flow statements
+- 45,741 reported financial facts (plus 4,765 derived quarterly values) from balance sheets, income statements, cash flow statements, segment disclosures and lease notes
 - Every value carries its exact XBRL period (start and end date), classified as a fiscal quarter, fiscal year, year-to-date or balance-sheet date, with fiscal-year/quarter labels that respect non-calendar fiscal years (MSFT: June, ORCL: May)
 - Quarters a filing doesn't report on its own (Q4, and cash-flow quarters, since 10-Qs only report cash flows year-to-date) are derived from year-to-date differences and flagged `is_derived`
+- One series per line item even where a company changed the XBRL tag between filings (Meta's `fb_` → `meta_`, Dominion's capex tag), and distinct items that share a label are told apart ("Services (expense)" vs "Services (sales revenue net)", "(basic)" vs "(diluted)")
+- **Business segments:** revenue, operating income, capex, D&A and assets per segment, e.g. AWS capex by quarter, or capex for Dominion Energy Virginia (the Data Center Alley utility)
+- **Leases:** future payments on leases signed but not yet commenced (the forward data-center pipeline: Microsoft $364.6B, Oracle $288B, Meta $355.7B as of their latest 10-Qs), right-of-use assets obtained for new leases (leased capacity that the cash capex line misses), and CoreWeave's undelivered contracted power in MW
 - SQL-queryable database for precise numerical queries with date ranges and filtering
 - Best for: Revenue, expenses, equity, assets, and specific financial metrics
 
@@ -163,6 +166,7 @@ The pipeline is incremental by accession number, so a refresh after a few months
 
 ```bash
 python -m edgar_rag rebuild-facts   # re-extract XBRL facts for ingested filings (after changing facts.py)
+python -m edgar_rag rebuild-series  # recompute series mappings and derived quarters from stored facts (no downloads)
 python -m edgar_rag embed           # embed any chunks still missing embeddings
 python -m edgar_rag ask "What was Microsoft's revenue in fiscal Q2 2025?"
 ```
@@ -197,6 +201,9 @@ ask("What was Microsoft's total revenue in Q2 2025?")
 ask("Compare operating expenses between Meta and Alphabet in 2024")
 ask("Show me Amazon's cash flow trends over the past 8 quarters")
 ask("How much did Amazon spend on purchases of property and equipment each quarter of 2025?")
+ask("What was AWS capex each quarter since 2024?")
+ask("How have leases not yet commenced grown at Microsoft, Meta and Oracle over the last two years?")
+ask("What were Dominion Energy Virginia's capital expenditures by year?")
 ```
 
 **Qualitative Analysis:**
@@ -248,10 +255,21 @@ Companies are looked up by CIK, not ticker. Tickers get reused: `Company("SPCX")
 
 Structured financial data from XBRL, one row per filing × concept × period × unit:
 
-- `concept`, `label` (the company's own line-item label), `value`, `unit` (`USD_millions`, `USD_per_share`, `shares`, `pure`)
+- `statement_type`: `balance_sheet`, `income_statement`, `cashflow`, `segment` or `leases`
+- `concept`, `label` (the company's own line-item label), `value`, `unit` (`USD_millions`, `USD_per_share`, `shares`, `pure`, `MW`)
+- `segment`: business segment name (e.g. `AWS`); NULL for company totals
 - `period_start` / `period_end` / `duration_days`, `fiscal_period` (`Q`, `6M`, `9M`, `FY`, `TTM`, `instant`), `fiscal_year`, `fiscal_quarter`
 - `is_derived` for quarters computed from year-to-date differences
-- `financial_facts_clean` (view): latest value per company × concept × period, so restatements win
+- `financial_facts_clean` (view): latest value per company × series × segment × period, so restatements win. `concept` and `label` are the series concept and display label from `fact_series`; the as-filed values are in `reported_concept` / `reported_label`
+
+### `fact_series`
+
+Recomputed per company after each ingest (`facts.build_series`). It maps each reported statement line item (concept + label) to:
+
+- `series_concept`: companies re-tag line items between filings, and the next filing's comparative column then repeats an old period under the new tag. Two concepts are merged when they were used with the same label, never report the same period in one filing, and report the same value for at least one period. The merged series takes the most recent concept.
+- `series_label`: the reported label, plus a qualifier taken from the concept name where distinct items in one statement share a label and unit (Oracle's "Services" revenue and expense, basic and diluted EPS).
+
+Segment and lease facts use uniform labels across companies ("Segment capital expenditures", "Leases not yet commenced (future lease payments)") under synthetic `edgar_rag_*` concepts, because companies change the underlying XBRL tags between years. `standard_concept` records the tag each value was read from.
 
 ### `document_chunks`
 
@@ -283,6 +301,8 @@ Reference table for company information (CIK, sector, fiscal year end), populate
 - Voyage AI has batch size limit of 128 texts per API call
 - The system automatically routes queries based on intent classification
 - Financial facts keep the company's own line-item labels; the same concept can be labelled differently across companies (e.g. capex is "Purchases of property and equipment" at Amazon, "Plant construction and other property additions" at Dominion)
+- Segment capex exists only where a company tags it: Amazon (quarterly) and Dominion (annual). Microsoft, Alphabet, Meta, Oracle and SpaceX report segment revenue and operating income only; CoreWeave reports a single segment
+- "Leases not yet commenced" is every company's own tagging, found by a fixed precedence of rules in `facts.py` (dedicated concepts, then lease-labelled purchase obligations). Values are total undiscounted payments over terms of up to 20 years, not annual spending, and some arrangements are conditional. Google's 10-Qs before 2025 and some Oracle 10-Qs don't tag the figure
 
 ## 🤝 Contributing
 
