@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS financial_facts (
     ticker           TEXT NOT NULL,
     filing_type      TEXT NOT NULL,
     filing_date      DATE NOT NULL,
-    statement_type   TEXT NOT NULL,   -- balance_sheet | income_statement | cashflow | segment | leases
+    statement_type   TEXT NOT NULL,   -- balance_sheet | income_statement | cashflow | segment | leases | backlog | ppe | commitments
     concept          TEXT NOT NULL,   -- e.g. us-gaap_PaymentsToAcquirePropertyPlantAndEquipment
     label            TEXT NOT NULL,   -- company's own line-item label (uniform labels for segment/leases)
     standard_concept TEXT,
@@ -100,6 +100,16 @@ CREATE TABLE IF NOT EXISTS fact_series (
     series_concept  TEXT NOT NULL,
     series_label    TEXT NOT NULL,
     PRIMARY KEY (ticker, statement_type, concept, label)
+);
+
+-- Computed per company after ingest (metrics.build_metric_map): which of the company's
+-- concepts carries each canonical metric (capex, revenue, ...), in order of preference.
+CREATE TABLE IF NOT EXISTS metric_concepts (
+    ticker   TEXT NOT NULL,
+    metric   TEXT NOT NULL,
+    concept  TEXT NOT NULL,
+    rank     INTEGER NOT NULL,
+    PRIMARY KEY (ticker, metric, concept)
 );
 
 CREATE TABLE IF NOT EXISTS document_chunks (
@@ -145,6 +155,20 @@ ORDER BY ticker, series_concept, unit, segment, period_start, period_end,
          filing_date DESC,
          CASE statement_type WHEN 'income_statement' THEN 0 WHEN 'balance_sheet' THEN 1 ELSE 2 END,
          accession DESC;
+"""
+
+
+# One row per (company, canonical metric, period): the same line item under one name for every
+# company, whatever concept and label each uses. Company totals only. Where a company reports
+# more than one candidate concept for a period, the preferred one (lowest rank) wins.
+METRICS_VIEW = """
+CREATE OR REPLACE VIEW financial_metrics AS
+SELECT DISTINCT ON (c.ticker, m.metric, c.unit, c.period_start, c.period_end)
+    m.metric, c.*
+FROM financial_facts_clean c
+JOIN metric_concepts m ON m.ticker = c.ticker AND m.concept = c.concept
+WHERE c.segment IS NULL AND c.unit = 'USD_millions'
+ORDER BY c.ticker, m.metric, c.unit, c.period_start, c.period_end, m.rank, c.filing_date DESC;
 """
 
 
@@ -209,7 +233,9 @@ def migrate():
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         _migrate_legacy(conn)
         conn.execute(text(SCHEMA))
+        conn.execute(text("DROP VIEW IF EXISTS financial_metrics"))  # depends on the clean view's columns
         conn.execute(text(CLEAN_VIEW))
+        conn.execute(text(METRICS_VIEW))
         for c in config.COMPANIES:
             conn.execute(text("""
                 INSERT INTO companies (ticker, cik, name, sector)

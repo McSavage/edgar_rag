@@ -4,7 +4,7 @@ A hybrid Retrieval-Augmented Generation (RAG) system for analyzing SEC filings u
 
 ## 🎯 Overview
 
-This is a work in progress. The original intent of this project was to support my interest in calculating LCOC - Levelised Cost Of Compute - $/PFLOP-hours for a datacenter. I wasn't optimistic that SEC filings would provide a lot of useful information for that, and this data seems to confirm it. You can see the quality of the results in the `edgar_rag_interface` notebook. I expect to iterate on this a few more times. I thought the exercise of building the data pipeline and infrastructure would be useful in itself.
+This is a work in progress. The original intent of this project was to support my interest in calculating LCOC - Levelised Cost Of Compute - $/PFLOP-hours for a datacenter. I wasn't optimistic that SEC filings would provide a lot of useful information for that. RAG usefulness is improving. You can see the quality of the results in the `edgar_rag_use_cases` notebook. I expect to iterate on this a few more times. I thought the exercise of building the data pipeline and infrastructure would be useful in itself.
 
 This system provides a natural language interface to analyze SEC filings (10-K and 10-Q reports) for major tech companies, a regulated utility, an AI cloud provider, and a launch/satellite company. It intelligently routes queries to either structured financial databases or vector-based semantic search depending on the question type, then synthesizes coherent answers using Claude.
 
@@ -18,25 +18,30 @@ This system provides a natural language interface to analyze SEC filings (10-K a
 
 ### 1. **Structured Financial Data (XBRL)**
 
-- 45,741 reported financial facts (plus 4,765 derived quarterly values) from balance sheets, income statements, cash flow statements, segment disclosures and lease notes
+- 47,083 reported financial facts (plus 4,753 derived quarterly values) from balance sheets, income statements, cash flow statements, segment disclosures and lease, backlog, property and commitment notes
 - Every value carries its exact XBRL period (start and end date), classified as a fiscal quarter, fiscal year, year-to-date or balance-sheet date, with fiscal-year/quarter labels that respect non-calendar fiscal years (MSFT: June, ORCL: May)
 - Quarters a filing doesn't report on its own (Q4, and cash-flow quarters, since 10-Qs only report cash flows year-to-date) are derived from year-to-date differences and flagged `is_derived`
 - One series per line item even where a company changed the XBRL tag between filings (Meta's `fb_` → `meta_`, Dominion's capex tag), and distinct items that share a label are told apart ("Services (expense)" vs "Services (sales revenue net)", "(basic)" vs "(diluted)")
 - **Business segments:** revenue, operating income, capex, D&A and assets per segment, e.g. AWS capex by quarter, or capex for Dominion Energy Virginia (the Data Center Alley utility)
 - **Leases:** future payments on leases signed but not yet commenced (the forward data-center pipeline: Microsoft $364.6B, Oracle $288B, Meta $355.7B as of their latest 10-Qs), right-of-use assets obtained for new leases (leased capacity that the cash capex line misses), and CoreWeave's undelivered contracted power in MW
+- **Backlog:** remaining performance obligations (contracted revenue not yet recognized), with Google Cloud's share as a segment value
+- **Property by class:** gross property and equipment by asset class — servers and network equipment, buildings, construction in progress / assets not yet in service — under labels of the form "Property and equipment, gross: <class>"
+- **Purchase commitments** other than leases, as each company totals them (not comparable across companies)
+- **Canonical metrics:** `financial_metrics` gives capex, revenue, operating cash flow, D&A and about twenty other line items under one name across companies
 - SQL-queryable database for precise numerical queries with date ranges and filtering
 - Best for: Revenue, expenses, equity, assets, and specific financial metrics
 
 ### 2. **Narrative Content Vector Search**
 
-- 40,150 text chunks from risk factors, MD&A sections, and business descriptions
+- 45,026 text chunks from risk factors, MD&A sections, and business descriptions
 - Vector embeddings via Voyage AI for semantic similarity search
 - PostgreSQL with pgvector (HNSW index with filtered iterative scans) for efficient retrieval
 - Best for: Risks, strategies, qualitative discussions, and business context
 
 ### 3. **Intelligent Query Router**
 
-- Claude classifies each query as quantitative, qualitative, or hybrid, and extracts companies, line-item keywords, quarterly vs. annual granularity and a date window (as structured output)
+- Claude classifies each query as quantitative, qualitative, or hybrid, and extracts companies, canonical metrics, line-item keywords, quarterly vs. annual granularity and a date window (as structured output). What it is told about the data (metrics, segments, note disclosures per company) is read from the database on each run
+- Narrative search returns one row per distinct passage (risk-factor language repeated across filings is collapsed, with the span of filings it appears in), respects the question's date window and ranks newer filings first among similar matches
 - Automatically retrieves from appropriate data sources, balanced per company
 - Synthesizes answers combining numbers with narrative context
 
@@ -80,12 +85,17 @@ edgar_rag/
 │   ├── db.py                  # schema + idempotent migrations
 │   ├── sec.py                 # EDGAR access via edgartools
 │   ├── facts.py               # XBRL fact extraction, period classification, derived quarters
+│   ├── metrics.py             # canonical metrics (capex, revenue, ...) → each company's concepts
 │   ├── narrative.py           # section splitting + chunking for RAG
 │   ├── embeddings.py          # Voyage AI embeddings
 │   ├── ingest.py              # incremental pipeline (update / rebuild-facts / status)
 │   ├── query.py               # router, retrieval, synthesis, ask()
+│   ├── checks.py              # data-quality checks (python -m edgar_rag check)
+│   ├── evals.py               # golden-question scoring (python -m edgar_rag eval)
 │   └── __main__.py            # CLI: python -m edgar_rag ...
-├── edgar_rag_interface.ipynb  # interactive interface (thin client over edgar_rag.query)
+├── evals/golden.json          # golden questions with known answers
+├── tests/                     # unit tests (pytest; no network or database)
+├── edgar_rag_use_cases.ipynb  # worked analyses: capex, lease pipeline, backlog, depreciation, ...
 └── requirements.txt
 ```
 
@@ -167,18 +177,21 @@ The pipeline is incremental by accession number, so a refresh after a few months
 ```bash
 python -m edgar_rag rebuild-facts   # re-extract XBRL facts for ingested filings (after changing facts.py)
 python -m edgar_rag rebuild-series  # recompute series mappings and derived quarters from stored facts (no downloads)
+python -m edgar_rag rebuild-chunks  # re-extract and re-embed narrative (after changing narrative.py); --flagged = only filings `check` reports
 python -m edgar_rag embed           # embed any chunks still missing embeddings
+python -m edgar_rag check           # data-quality checks: quarters sum to the year, thin filings, cut-off sections, missing embeddings
+python -m edgar_rag eval            # golden questions: --level data (free) | retrieval | answer
 python -m edgar_rag ask "What was Microsoft's revenue in fiscal Q2 2025?"
 ```
 
 ## 💡 Usage
 
-### Interactive Interface
+### Use-Case Notebook
 
-Open the main interface notebook:
+Worked analyses (capex, lease pipeline, backlog, depreciation, segments) plus `ask()` examples:
 
 ```bash
-jupyter notebook edgar_rag_interface.ipynb
+jupyter notebook edgar_rag_use_cases.ipynb
 ```
 
 ### Simple Query Interface
@@ -255,12 +268,23 @@ Companies are looked up by CIK, not ticker. Tickers get reused: `Company("SPCX")
 
 Structured financial data from XBRL, one row per filing × concept × period × unit:
 
-- `statement_type`: `balance_sheet`, `income_statement`, `cashflow`, `segment` or `leases`
+- `statement_type`: `balance_sheet`, `income_statement`, `cashflow`, `segment`, `leases`, `backlog`, `ppe` or `commitments`
 - `concept`, `label` (the company's own line-item label), `value`, `unit` (`USD_millions`, `USD_per_share`, `shares`, `pure`, `MW`)
 - `segment`: business segment name (e.g. `AWS`); NULL for company totals
 - `period_start` / `period_end` / `duration_days`, `fiscal_period` (`Q`, `6M`, `9M`, `FY`, `TTM`, `instant`), `fiscal_year`, `fiscal_quarter`
-- `is_derived` for quarters computed from year-to-date differences
+- `is_derived` for quarters computed from year-to-date differences. The two figures are taken from the same reporting basis: when a later filing recasts a full year but no filing recasts the year-to-date figure (segment reorganizations, discontinued operations), the quarter stays on the originally reported basis rather than mixing the two
 - `financial_facts_clean` (view): latest value per company × series × segment × period, so restatements win. `concept` and `label` are the series concept and display label from `fact_series`; the as-filed values are in `reported_concept` / `reported_label`
+
+### `financial_metrics` (view) and `metric_concepts`
+
+The same line item under one name at every company, whatever concept and label each uses: `revenue`, `operating_income`, `capex`, `operating_cash_flow`, `depreciation_amortization`, `construction_in_progress`, `servers_and_network_equipment`, `leases_not_yet_commenced`, `remaining_performance_obligations` and more (the full list, with the concepts each accepts in order of preference, is in `edgar_rag/metrics.py`). `metric_concepts` records which of a company's concepts carries each metric and is recomputed after each ingest. Company totals only.
+
+```sql
+SELECT ticker, period_end, value FROM financial_metrics
+WHERE metric = 'capex' AND fiscal_period = 'Q' ORDER BY ticker, period_end;
+```
+
+The query router picks metrics by name, so a question about capex no longer depends on guessing each company's label.
 
 ### `fact_series`
 
@@ -277,6 +301,7 @@ Narrative content for vector search:
 
 - Text chunks from SEC filings, linked to `filings` by accession
 - Normalized section names (risk factors, MD&A, business, notes)
+- Sections are found from markdown headings; where those capture less than a fifth of the text, a prospectus-style table of contents or the 10-K/10-Q Item parser is used instead
 - Vector embeddings (512 or 1024 dimensions), HNSW index
 
 ### `filings`

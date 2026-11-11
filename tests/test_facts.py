@@ -74,6 +74,30 @@ def test_reported_quarter_is_not_overwritten():
     assert derive_quarters(rows, 12) == []
 
 
+def test_derived_quarter_uses_one_reporting_basis():
+    # Microsoft FY2023 Intelligent Cloud revenue: the FY2025 10-K recast the year for the August 2024
+    # segment change, but no filing ever recast the nine months. Q4 must stay on the original basis.
+    def v(acc, filed, start, end, value, period):
+        return {**_fact(start, end, value, period), "accession": acc, "filing_date": filed}
+    fy_start = date(2022, 7, 1)
+    rows = [v("q3", date(2023, 4, 25), fy_start, date(2023, 3, 31), 63914, "9M"),
+            v("k23", date(2023, 7, 27), fy_start, date(2023, 6, 30), 87907, "FY"),
+            v("q3next", date(2024, 4, 25), fy_start, date(2023, 3, 31), 63914, "9M"),
+            v("k24", date(2024, 7, 30), fy_start, date(2023, 6, 30), 87907, "FY"),
+            v("k25", date(2025, 7, 30), fy_start, date(2023, 6, 30), 72944, "FY")]
+    (d,) = derive_quarters(rows, 6)
+    assert d["value"] == 87907 - 63914 and d["accession"] == "k23"
+
+    # Both figures recast (the nine months in the next year's Q3 10-Q, the year in the next 10-K):
+    # the newer basis wins. A recast nine months with no recast year yet falls back to the old basis.
+    recast = rows[:2] + [v("q3next", date(2024, 4, 25), fy_start, date(2023, 3, 31), 53000, "9M"),
+                         v("k24", date(2024, 7, 30), fy_start, date(2023, 6, 30), 72944, "FY")]
+    (d,) = derive_quarters(recast, 6)
+    assert d["value"] == 72944 - 53000 and d["accession"] == "k24"
+    (d,) = derive_quarters(recast[:3], 6)
+    assert d["value"] == 87907 - 63914 and d["accession"] == "k23"
+
+
 def test_toc_sections_and_paragraph_splitting():
     md = ("| PROSPECTUS SUMMARY........ | 1 |\n| RISK FACTORS........ | 27 |\n| BUSINESS........ | 130 |\n\n"
           "1 PROSPECTUS SUMMARY This summary highlights things. "
@@ -209,3 +233,18 @@ def test_series_needs_matching_values_and_label():
 def test_norm_label():
     assert norm_label("Net income (loss) attributable to Dominion Energy") == "net income attributable to dominion energy"
     assert norm_label("Total stockholders\u2019 equity") == norm_label("Total stockholders' equity")
+
+
+def test_collapse_repeats_keeps_one_row_per_passage():
+    from edgar_rag.query import collapse_repeats
+    boiler = "The availability, reliability, and cost of electrical power are critical to our datacenters. " * 5
+    df = pd.DataFrame([
+        {"ticker": "MSFT", "filing_date": date(2025, 7, 30), "chunk_text": boiler, "similarity": 0.58},
+        {"ticker": "MSFT", "filing_date": date(2026, 7, 29), "chunk_text": boiler.replace("  ", " ") + "\n", "similarity": 0.57},
+        {"ticker": "MSFT", "filing_date": date(2026, 10, 28), "chunk_text": "We signed new power agreements this quarter.", "similarity": 0.50},
+    ])
+    latest = collapse_repeats(df).set_index("filing_date")
+    assert len(latest) == 2
+    assert latest.loc[date(2026, 7, 29), "repeats"] == 1 and latest.loc[date(2026, 7, 29), "similarity"] == 0.58
+    assert latest.loc[date(2026, 7, 29), "first_filed"] == date(2025, 7, 30)
+    assert date(2025, 7, 30) in set(collapse_repeats(df, keep="earliest")["filing_date"])

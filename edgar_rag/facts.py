@@ -21,6 +21,8 @@ spending and are extracted with uniform labels (statement_type in parentheses):
   capacity that never shows up as cash capex), and future payments on leases
   signed but not yet commenced (the forward data-center pipeline). The latter
   is tagged differently by every company, hence the per-company rules.
+- backlog (backlog), gross property and equipment by asset class (ppe) and non-lease
+  purchase commitments (commitments): see the section further down.
 """
 
 import re
@@ -34,6 +36,8 @@ STATEMENTS = (
     ("cashflow", "cashflow_statement"),
 )
 FLOW_STATEMENTS = ("income_statement", "cashflow")
+# Statement types whose duration facts get missing quarters derived.
+FLOW_FACT_STATEMENTS = ("income_statement", "cashflow", "segment", "leases")
 
 
 # ── period classification ────────────────────────────────────
@@ -193,6 +197,9 @@ def extract_facts(filing, ticker, fye_month):
     _add_segment_facts(rows, all_df)
     _add_lease_flow_facts(rows, by_concept, statement_concepts)
     _add_lease_commitments(rows, all_df, ticker, balance_date(filing, all_df))
+    _add_backlog_facts(rows, all_df, plain)
+    _add_property_class_facts(rows, all_df, plain, statement_concepts)
+    _add_commitment_facts(rows, all_df, plain, statement_concepts)
     return rows.rows, "ok"
 
 
@@ -370,6 +377,133 @@ def _add_lease_commitments(rows, all_df, ticker, as_of):
                  value=float(power["numeric_value"].drop_duplicates().sum()), unit="MW")
 
 
+# ── backlog, property classes, purchase commitments ──────────
+# Three more note disclosures that bear on AI-infrastructure economics. All are balance-date
+# values; every date a filing reports (current and comparative) is stored.
+#   backlog      remaining performance obligations: contracted revenue not yet recognized
+#   ppe          gross property and equipment by asset class (servers, buildings, construction
+#                in progress, ...): what the capex was spent on, and how much is not yet in service
+#   commitments  purchase commitments other than leases (leases not yet commenced are above)
+
+RPO_CONCEPT = "edgar_rag_RemainingPerformanceObligation"
+RPO_LABEL = "Remaining performance obligations (contracted revenue not yet recognized)"
+_RPO_SOURCE = "us-gaap:RevenueRemainingPerformanceObligation"
+_RPO_TIMING_AXIS = "dim_us-gaap_RevenueRemainingPerformanceObligationExpectedTimingOfSatisfactionStartDateAxis"
+
+_PPE_CLASS_AXIS = "dim_us-gaap_PropertyPlantAndEquipmentByTypeAxis"
+_PPE_GROSS_SOURCES = (
+    "us-gaap:PropertyPlantAndEquipmentGross",
+    # Alphabet reports owned assets together with finance-lease assets.
+    "us-gaap:PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetBeforeAccumulatedDepreciationAndAmortization",
+)
+_CIP_SOURCE = "us-gaap:ConstructionInProgressGross"  # Oracle tags it as its own concept, without a class member
+# Microsoft tags each class as its own concept instead of a member of the class axis.
+_PPE_CLASS_CONCEPT = re.compile(
+    r"^(?:us-gaap:(?:Land|LandAndLandImprovements|BuildingsAndImprovementsGross|LeaseholdImprovementsGross|"
+    r"FurnitureAndFixturesGross|MachineryAndEquipmentGross|CapitalizedComputerSoftwareGross|"
+    r"PropertyPlantAndEquipmentOther)|[a-z]+:Computer(?:Equipment|Hardware)\w*)$")
+PPE_LABEL = "Property and equipment, gross: {}"
+
+_PO_CATEGORY_AXIS = "dim_us-gaap_UnrecordedUnconditionalPurchaseObligationByCategoryOfItemPurchasedAxis"
+# Company totals, each its own line item because the definitions differ between companies.
+COMMITMENT_TOTALS = {
+    _PURCHASE_OBLIGATION: ("edgar_rag_PurchaseObligations", "Unconditional purchase obligations (total, excluding leases)"),
+    "us-gaap:PurchaseObligation": ("us-gaap_PurchaseObligation", "Purchase obligations (total)"),
+    # Meta: non-cancelable commitments other than leases; Amazon: the total of its commitments table.
+    "us-gaap:ContractualObligation": ("us-gaap_ContractualObligation", "Contractual commitments (total as the company defines it)"),
+    "us-gaap:LongTermPurchaseCommitmentAmount": ("us-gaap_LongTermPurchaseCommitmentAmount", "Long-term purchase commitments"),
+}
+COMMITMENT_CATEGORY_LABEL = "Purchase obligations: {}"
+
+
+def _camel(text_):
+    return "".join(w[:1].upper() + w[1:] for w in re.findall(r"[A-Za-z0-9]+", text_))
+
+
+def _with_only(df, *axes):
+    """Facts dimensioned on exactly the given axes and no others."""
+    if any(a not in df.columns for a in axes):
+        return df.iloc[0:0]
+    others = [c for c in df.columns if c.startswith("dim_") and c not in axes]
+    mask = df[list(axes)].notna().all(axis=1)
+    if others:
+        mask &= df[others].isna().all(axis=1)
+    return df[mask]
+
+
+def _member(f):
+    """'Long-Lived Asset, Class: Construction in progress' -> 'Construction in progress'."""
+    return str(f["full_dimension_label"]).rsplit(": ", 1)[-1].strip()
+
+
+def _instant_facts(df):
+    return df[df["period_type"] == "instant"]
+
+
+def _add_backlog_facts(rows, all_df, plain):
+    source = _instant_facts(all_df[all_df["concept"] == _RPO_SOURCE])
+    if source.empty:
+        return
+    std = _key(_RPO_SOURCE)
+    for _, f in plain[plain["concept"] == _RPO_SOURCE].iterrows():
+        rows.add(f, "backlog", RPO_CONCEPT, RPO_LABEL, standard_concept=std)
+    # Amazon tags the total only on the expected-timing axis; tranches, where given, add up to it.
+    timed = _with_only(source, _RPO_TIMING_AXIS)
+    for _, group in timed.groupby("period_instant"):
+        tranches = group.drop_duplicates(_RPO_TIMING_AXIS)
+        rows.add(tranches.iloc[0], "backlog", RPO_CONCEPT, RPO_LABEL, standard_concept=std,
+                 value=float(tranches["numeric_value"].sum()) / 1_000_000, unit="USD_millions")
+    for _, f in _with_only(source, SEGMENT_AXIS).iterrows():
+        name = segment_name(f["full_dimension_label"])
+        if name:
+            rows.add(f, "backlog", RPO_CONCEPT, RPO_LABEL, standard_concept=std, segment=name)
+
+
+def _add_property_class_facts(rows, all_df, plain, statement_concepts):
+    for source in _PPE_GROSS_SOURCES:
+        by_class = _instant_facts(_with_only(all_df[all_df["concept"] == source], _PPE_CLASS_AXIS))
+        for _, f in by_class.iterrows():
+            name = _member(f)
+            rows.add(f, "ppe", f"edgar_rag_PPEGross_{_camel(name)}", PPE_LABEL.format(name),
+                     standard_concept=str(f[_PPE_CLASS_AXIS]).replace(":", "_", 1))
+        if _key(source) not in statement_concepts:  # the total, unless the balance sheet already has it
+            for _, f in _instant_facts(plain[plain["concept"] == source]).iterrows():
+                rows.add(f, "ppe", "edgar_rag_PPEGross_Total", PPE_LABEL.format("Total"), standard_concept=_key(source))
+    separate = plain[plain["concept"].str.match(_PPE_CLASS_CONCEPT)]
+    for _, f in _instant_facts(separate).iterrows():
+        if _key(f["concept"]) not in statement_concepts:
+            name = str(f["label"]).strip()
+            rows.add(f, "ppe", f"edgar_rag_PPEGross_{_camel(name)}", PPE_LABEL.format(name),
+                     standard_concept=_key(f["concept"]))
+    if _key(_CIP_SOURCE) not in statement_concepts:
+        for _, f in _instant_facts(plain[plain["concept"] == _CIP_SOURCE]).iterrows():
+            rows.add(f, "ppe", "edgar_rag_PPEGross_ConstructionInProgress",
+                     PPE_LABEL.format("Construction in progress"), standard_concept=_key(_CIP_SOURCE))
+
+
+def _add_commitment_facts(rows, all_df, plain, statement_concepts):
+    for source, (concept, label) in COMMITMENT_TOTALS.items():
+        if _key(source) in statement_concepts:
+            continue
+        facts_ = plain[plain["concept"] == source]
+        if source == "us-gaap:LongTermPurchaseCommitmentAmount":
+            # Alphabet tags its balance-date commitment in a year-to-date context.
+            facts_ = facts_.assign(period_instant=facts_["period_instant"].fillna(facts_["period_end"]),
+                                   period_type="instant")
+        facts_ = _instant_facts(facts_)
+        # Meta and Alphabet tag leases not yet commenced with the purchase-obligation concept.
+        facts_ = facts_[~facts_["label"].fillna("").str.contains(_LEASE_TEXT)]
+        for _, f in facts_.iterrows():
+            rows.add(f, "commitments", concept, label, standard_concept=_key(source))
+    by_category = _instant_facts(_with_only(all_df[all_df["concept"] == _PURCHASE_OBLIGATION], _PO_CATEGORY_AXIS))
+    for _, f in by_category.iterrows():
+        name = _member(f)
+        if _LEASE_TEXT.search(name) or re.search(r"\blease", name, re.I):
+            continue
+        rows.add(f, "commitments", f"edgar_rag_PurchaseObligations_{_camel(name)}",
+                 COMMITMENT_CATEGORY_LABEL.format(name), standard_concept=_key(_PURCHASE_OBLIGATION))
+
+
 FACT_COLUMNS = ["accession", "ticker", "filing_type", "filing_date", "statement_type", "concept",
                 "label", "standard_concept", "segment", "value", "unit", "period_type", "period_start",
                 "period_end", "duration_days", "fiscal_period", "fiscal_year", "fiscal_quarter",
@@ -381,42 +515,89 @@ FACT_COLUMNS = ["accession", "ticker", "filing_type", "filing_date", "statement_
 _YTD_STEPS = {"6M": "Q", "9M": "6M", "FY": "9M"}  # period -> the YTD period one quarter shorter
 
 
-def derive_quarters(clean_rows, fye_month):
+def _runs(versions):
+    """Consecutive filings reporting the same value: [(first filing key, value, last row)], oldest first."""
+    runs = []
+    for v in versions:
+        value = float(v["value"])
+        if runs and runs[-1][1] == value:
+            runs[-1] = (runs[-1][0], value, v)
+        else:
+            runs.append(((v["filing_date"], v["accession"]), value, v))
+    return runs
+
+
+def _same_basis_pair(longer, shorter):
+    """(longer row, shorter value) reported on the same basis, preferring the most recent basis.
+
+    Companies recast prior periods (segment reorganizations, discontinued operations,
+    reclassifications), and a recast full-year figure is often never accompanied by a recast
+    year-to-date one, so "latest minus latest" can subtract across two bases (Microsoft's
+    FY2023 Q4 Intelligent Cloud revenue came out at 9.0B between quarters of 22.1B and 20.0B).
+
+    A value of the shorter period holds from the first filing that reports it until a filing
+    reports a different one. The matching longer-period value is the first one filed within
+    that span: the 10-K that follows the Q3 10-Q, or the next 10-Q's year-to-date column. The
+    newest shorter value with such a partner wins; if the newest has none (recast, but the
+    longer period not yet re-reported), the previous basis is used.
+    """
+    runs = _runs(shorter)
+    for i in range(len(runs) - 1, -1, -1):
+        since, value, _ = runs[i]
+        until = runs[i + 1][0] if i + 1 < len(runs) else None
+        for row in longer:  # oldest first
+            filed = (row["filing_date"], row["accession"])
+            if filed >= since and (until is None or filed < until):
+                return row, value
+    return None
+
+
+_STATEMENT_ORDER = {"income_statement": 0, "balance_sheet": 1}
+
+
+def derive_quarters(rows, fye_month):
     """Compute missing discrete quarters as differences of year-to-date flows.
 
-    clean_rows: deduplicated duration facts (latest value per concept/period) for one
-    company, monetary flows only. A 6M/9M/FY value minus the reported value for the
-    same fiscal year one quarter shorter (same period_start) gives that quarter.
-    Only emitted where no reported 3-month value exists for that quarter.
+    rows: every reported duration fact of one company in every filing that reports it
+    (monetary flows only; `concept` is the series concept). A 6M/9M/FY value minus the
+    value for the same fiscal year one quarter shorter (same period_start) gives that
+    quarter; the two are taken from the same reporting basis (see _same_basis_pair), so
+    the derived row carries the filing of the longer-period value actually used, which
+    is not always the latest one. Only emitted where no filing reports that quarter.
     """
-    by_key = {}
+    versions = {}
     reported_quarters = set()
-    for r in clean_rows:
+    ordered = sorted(rows, key=lambda r: (r["filing_date"], r["accession"],
+                                          _STATEMENT_ORDER.get(r["statement_type"], 2)))
+    for r in ordered:
         series = (r["concept"], r["unit"], r.get("segment"))
-        by_key[(*series, r["period_start"], r["fiscal_period"])] = r
         if r["fiscal_period"] == "Q":
             reported_quarters.add((*series, r["period_end"]))
+        bucket = versions.setdefault((*series, r["period_start"], r["fiscal_period"]), [])
+        if not bucket or bucket[-1]["accession"] != r["accession"]:  # one value per filing
+            bucket.append(r)
 
     derived = []
-    for r in clean_rows:
-        shorter = _YTD_STEPS.get(r["fiscal_period"])
-        if not shorter:
+    for (*series, period_start, fiscal_period), longer in versions.items():
+        shorter = versions.get((*series, period_start, _YTD_STEPS.get(fiscal_period)))
+        period_end = longer[-1]["period_end"]
+        if not shorter or (*series, period_end) in reported_quarters:
             continue
-        series = (r["concept"], r["unit"], r.get("segment"))
-        prev = by_key.get((*series, r["period_start"], shorter))
-        if prev is None or (*series, r["period_end"]) in reported_quarters:
+        pair = _same_basis_pair(longer, shorter)
+        if pair is None:
             continue
-        start = prev["period_end"] + timedelta(days=1)
-        days = (r["period_end"] - start).days + 1
-        if classify_period(start, r["period_end"], fye_month) != "Q":
+        r, prev_value = pair
+        start = shorter[-1]["period_end"] + timedelta(days=1)
+        days = (period_end - start).days + 1
+        if classify_period(start, period_end, fye_month) != "Q":
             continue
-        fiscal_year, fiscal_quarter = fiscal_labels(r["period_end"], fye_month)
+        fiscal_year, fiscal_quarter = fiscal_labels(period_end, fye_month)
         derived.append({
             **{k: r[k] for k in ("accession", "ticker", "filing_type", "filing_date", "statement_type",
                                  "concept", "label", "standard_concept", "unit")},
             "segment": r.get("segment"),
-            "value": float(r["value"]) - float(prev["value"]),
-            "period_type": "duration", "period_start": start, "period_end": r["period_end"],
+            "value": float(r["value"]) - prev_value,
+            "period_type": "duration", "period_start": start, "period_end": period_end,
             "duration_days": days, "fiscal_period": "Q",
             "fiscal_year": fiscal_year, "fiscal_quarter": fiscal_quarter, "is_derived": True,
         })

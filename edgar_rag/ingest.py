@@ -9,7 +9,7 @@ from datetime import datetime
 
 from sqlalchemy import text
 
-from . import config, db, embeddings, facts, narrative, sec
+from . import config, db, embeddings, facts, metrics, narrative, sec
 
 
 def _select(tickers):
@@ -80,7 +80,7 @@ def process_filing(filing, spec, fye, do_facts=True, do_chunks=True):
                 status = "empty"  # parsed, but no narrative sections found: worth a look
             fields.update(chunks_status=status, n_chunks=n)
             print(f"      chunks: {n} ({status})")
-        conn.execute(text(f"UPDATE filings SET {', '.join(f'{k} = :{k}' for k in fields)}, processed_at = now() "
+        conn.execute(text(f"UPDATE filings SET {', '.join(f'{k} = :{k}' for k in fields)}, error = NULL, processed_at = now() "
                           "WHERE accession = :accession"), {**fields, "accession": filing.accession_number})
 
 
@@ -103,18 +103,39 @@ def build_series(conn, spec):
 
 
 def finalize(conn, spec, fye):
-    """Company-level steps after its filings change: series mapping, then derived quarters."""
+    """Company-level steps after its filings change: series mapping, derived quarters, metric map."""
     build_series(conn, spec)
     derive_quarters(conn, spec, fye)
+    build_metric_map(conn, spec)
+
+
+def build_metric_map(conn, spec):
+    concepts = conn.execute(text("SELECT DISTINCT concept FROM financial_facts_clean WHERE ticker = :t AND segment IS NULL"),
+                            {"t": spec.ticker}).scalars().all()
+    rows = [{"ticker": spec.ticker, "metric": m, "concept": c, "rank": r}
+            for m, c, r in metrics.build_metric_map(concepts)]
+    conn.execute(text("DELETE FROM metric_concepts WHERE ticker = :t"), {"t": spec.ticker})
+    db.bulk_insert(conn, "metric_concepts", rows, ["ticker", "metric", "concept", "rank"])
+    missing = sorted(set(metrics.METRIC_NAMES) - {r["metric"] for r in rows})
+    print(f"  ✓ {spec.ticker}: {len(metrics.METRIC_NAMES) - len(missing)} of {len(metrics.METRIC_NAMES)} metrics mapped"
+          + (f" (none for: {', '.join(missing)})" if missing else ""))
 
 
 def derive_quarters(conn, spec, fye):
     conn.execute(text("DELETE FROM financial_facts WHERE ticker = :t AND is_derived"), {"t": spec.ticker})
+    # Every filing's version of each reported flow (not just the latest), under its series
+    # concept and label, so a quarter is derived from two figures on the same basis.
     rows = conn.execute(text("""
-        SELECT * FROM financial_facts_clean
-        WHERE ticker = :t AND unit = 'USD_millions' AND period_type = 'duration'
-          AND statement_type IN ('income_statement', 'cashflow', 'segment', 'leases')
-    """), {"t": spec.ticker}).mappings().all()
+        SELECT f.accession, f.ticker, f.filing_type, f.filing_date, f.statement_type,
+               COALESCE(s.series_concept, f.concept) AS concept, COALESCE(s.series_label, f.label) AS label,
+               f.standard_concept, f.segment, f.value, f.unit, f.period_start, f.period_end, f.fiscal_period
+        FROM financial_facts f
+        LEFT JOIN fact_series s
+          ON s.ticker = f.ticker AND s.statement_type = f.statement_type AND s.concept = f.concept
+         AND s.label = f.label
+        WHERE f.ticker = :t AND NOT f.is_derived AND f.unit = 'USD_millions' AND f.period_type = 'duration'
+          AND f.statement_type = ANY(:st)
+    """), {"t": spec.ticker, "st": list(facts.FLOW_FACT_STATEMENTS)}).mappings().all()
     derived = facts.derive_quarters([dict(r) for r in rows], fye)
     n = db.bulk_insert(conn, "financial_facts", derived, facts.FACT_COLUMNS)
     print(f"  ✓ {spec.ticker}: derived {n} quarterly values from year-to-date differences")
@@ -184,6 +205,36 @@ def rebuild_facts(tickers=None):
             finalize(conn, spec, fye)
 
 
+def rebuild_chunks(tickers=None, accessions=None, embed=True):
+    """Re-extract narrative chunks for ingested filings (facts are untouched), then embed them.
+
+    accessions: restrict to these filings (e.g. the ones `check` reports as thin or cut off).
+    The filings' existing chunks and embeddings are replaced.
+    """
+    db.migrate()
+    wanted = set(accessions) if accessions is not None else None
+    for spec in _select(tickers):
+        with db.get_engine().begin() as conn:
+            fye = _fye(conn, spec)
+            existing = _existing(conn, spec.ticker)
+        todo = [f for f in sec.list_filings(spec)
+                if f.accession_number in existing and (wanted is None or f.accession_number in wanted)]
+        if not todo:
+            continue
+        print(f"\n{'=' * 60}\n{spec.ticker} — rebuilding narrative chunks for {len(todo)} filings\n{'=' * 60}")
+        for f in todo:
+            try:
+                process_filing(f, spec, fye, do_facts=False, do_chunks=True)
+            except Exception as e:
+                print(f"      ✗ {e}")
+                with db.get_engine().begin() as conn:
+                    conn.execute(text("UPDATE filings SET chunks_status = 'failed', error = :e WHERE accession = :a"),
+                                 {"e": str(e)[:2000], "a": f.accession_number})
+    if embed:
+        print()
+        embeddings.embed_pending()
+
+
 def rebuild_series(tickers=None):
     """Recompute series mappings and derived quarters from stored facts (no downloads)."""
     db.migrate()
@@ -212,3 +263,8 @@ def status():
         for i, v in enumerate((n, failed, nf, nd, nc, ne)):
             tot[i] += v
     print(f"{'total':6} {tot[0]:7} {'':>10} {'':>10} {tot[1]:6} {tot[2]:7,} {tot[3]:7,} {tot[4]:7,} {tot[5]:8,}")
+    from . import checks
+    thin = checks.thin_filings()
+    if not thin.empty:
+        print(f"⚠ {len(thin)} filing(s) have far less narrative than usual for that company; "
+              "see `python -m edgar_rag check`")

@@ -1,0 +1,135 @@
+[
+  {
+    "id": "amzn-capex-quarters",
+    "question": "How much did Amazon spend on purchases of property and equipment each quarter of 2025?",
+    "note": "Q2-Q4 are derived from year-to-date cash flows; the four quarters sum to the 131,819 full year.",
+    "route": {"tickers": ["AMZN"], "metrics": ["capex"], "granularity": "quarterly"},
+    "facts": [
+      {"ticker": "AMZN", "metric": "capex", "fiscal_period": "Q", "period_end": "2025-03-31", "value": 25019},
+      {"ticker": "AMZN", "metric": "capex", "fiscal_period": "Q", "period_end": "2025-06-30", "value": 32183},
+      {"ticker": "AMZN", "metric": "capex", "fiscal_period": "Q", "period_end": "2025-12-31", "value": 39522}
+    ],
+    "answer": [["25,019", "25.0"], ["32,183", "32.2"], ["39,522", "39.5"]]
+  },
+  {
+    "id": "msft-fiscal-q2-revenue",
+    "question": "What was Microsoft's total revenue in fiscal Q2 2025?",
+    "note": "The quarter ending 2024-12-31. Before the 2026-11 refactor this returned the six-month figure, 135,217.",
+    "route": {"tickers": ["MSFT"], "metrics": ["revenue"]},
+    "facts": [{"ticker": "MSFT", "metric": "revenue", "fiscal_period": "Q", "period_end": "2024-12-31", "value": 69632}],
+    "answer": [["69,632", "69.6"]]
+  },
+  {
+    "id": "msft-ic-fy23-q4",
+    "question": "What was Microsoft Intelligent Cloud segment revenue in each quarter of fiscal 2023?",
+    "note": "Q4 is derived on the originally reported basis (87,907 - 63,914). Mixing it with the FY2023 total as recast in 2025 gave 9,030.",
+    "route": {"tickers": ["MSFT"], "include_segments": true},
+    "facts": [{"ticker": "MSFT", "label": "Segment revenue", "segment": "Intelligent Cloud", "fiscal_period": "Q",
+               "period_end": "2023-06-30", "value": 23993}],
+    "answer": [["23,993", "24.0"]]
+  },
+  {
+    "id": "hyperscaler-capex-latest-quarter",
+    "question": "Compare capital expenditures at Microsoft, Alphabet, Meta and Oracle in their most recent quarter.",
+    "note": "Four different labels for the same line item; the metric must find all of them.",
+    "route": {"tickers": ["MSFT", "GOOGL", "META", "ORCL"], "metrics": ["capex"]},
+    "facts": [
+      {"ticker": "MSFT", "metric": "capex", "fiscal_period": "Q", "period_end": "2026-09-30", "value": 39367},
+      {"ticker": "GOOGL", "metric": "capex", "fiscal_period": "Q", "period_end": "2026-09-30", "value": 51355},
+      {"ticker": "META", "metric": "capex", "fiscal_period": "Q", "period_end": "2026-09-30", "value": 33942},
+      {"ticker": "ORCL", "metric": "capex", "fiscal_period": "Q", "period_end": "2026-08-31", "value": 28499}
+    ],
+    "answer": [["39,367", "39.4"], ["51,355", "51.4"], ["33,942", "33.9"], ["28,499", "28.5"]]
+  },
+  {
+    "id": "leases-not-commenced",
+    "question": "How large are leases not yet commenced at Microsoft, Meta and Oracle as of their latest filings, and what are the leases for?",
+    "route": {"tickers": ["MSFT", "META", "ORCL"], "metrics": ["leases_not_yet_commenced"]},
+    "facts": [
+      {"ticker": "MSFT", "metric": "leases_not_yet_commenced", "fiscal_period": "instant", "period_end": "2026-09-30", "value": 364600},
+      {"ticker": "META", "metric": "leases_not_yet_commenced", "fiscal_period": "instant", "period_end": "2026-09-30", "value": 355730},
+      {"ticker": "ORCL", "metric": "leases_not_yet_commenced", "fiscal_period": "instant", "period_end": "2026-08-31", "value": 288000}
+    ],
+    "narrative": {"tickers": ["MSFT", "META", "ORCL"], "phrases": ["not yet commenced"]},
+    "answer": [["364.6", "364,600"], ["355.7", "355,730"], ["288"], ["data center", "datacenter"]]
+  },
+  {
+    "id": "aws-capex-and-income",
+    "question": "What were AWS capital expenditures and AWS operating income in the third quarter of 2026?",
+    "route": {"tickers": ["AMZN"], "include_segments": true},
+    "facts": [
+      {"ticker": "AMZN", "label": "Segment capital expenditures", "segment": "AWS", "fiscal_period": "Q", "period_end": "2026-09-30", "value": 57116},
+      {"ticker": "AMZN", "label": "Segment operating income", "segment": "AWS", "fiscal_period": "Q", "period_end": "2026-09-30", "value": 17773}
+    ],
+    "answer": [["57,116", "57.1"], ["17,773", "17.8"]]
+  },
+  {
+    "id": "dominion-virginia-capex",
+    "question": "What were Dominion Energy Virginia's capital expenditures in 2025, and how does Dominion describe data center demand?",
+    "route": {"tickers": ["D"], "include_segments": true},
+    "facts": [{"ticker": "D", "label": "Segment capital expenditures", "segment": "Dominion Energy Virginia",
+               "fiscal_period": "FY", "period_end": "2025-12-31", "value": 10548}],
+    "narrative": {"tickers": ["D"], "phrases": ["data center"], "filed_after": "2026-01-01"},
+    "answer": [["10,548", "10.5"], ["data center"]]
+  },
+  {
+    "id": "backlog",
+    "question": "How large are remaining performance obligations at Microsoft and Oracle as of their latest filings?",
+    "route": {"tickers": ["MSFT", "ORCL"], "metrics": ["remaining_performance_obligations"]},
+    "facts": [
+      {"ticker": "MSFT", "metric": "remaining_performance_obligations", "fiscal_period": "instant", "period_end": "2026-09-30", "value": 683000},
+      {"ticker": "ORCL", "metric": "remaining_performance_obligations", "fiscal_period": "instant", "period_end": "2026-08-31", "value": 664000}
+    ],
+    "answer": [["683"], ["664"]]
+  },
+  {
+    "id": "google-cloud-backlog",
+    "question": "How much of Alphabet's revenue backlog belongs to Google Cloud?",
+    "route": {"tickers": ["GOOGL"], "include_segments": true},
+    "facts": [{"ticker": "GOOGL", "label": "Remaining performance obligations%", "segment": "Google Cloud",
+               "fiscal_period": "instant", "period_end": "2026-09-30", "value": 560800}],
+    "answer": [["560.8", "560,800"]]
+  },
+  {
+    "id": "construction-in-progress",
+    "question": "How much property is not yet in service (construction in progress) at Meta and Alphabet in the latest quarter?",
+    "route": {"tickers": ["META", "GOOGL"], "metrics": ["construction_in_progress"]},
+    "facts": [
+      {"ticker": "META", "metric": "construction_in_progress", "fiscal_period": "instant", "period_end": "2026-09-30", "value": 89499},
+      {"ticker": "GOOGL", "metric": "construction_in_progress", "fiscal_period": "instant", "period_end": "2026-09-30", "value": 145270}
+    ],
+    "answer": [["89,499", "89.5"], ["145,270", "145.3"]]
+  },
+  {
+    "id": "coreweave-power",
+    "question": "How many megawatts of contracted power has CoreWeave not yet taken delivery of, and what was its revenue last quarter?",
+    "route": {"tickers": ["CRWV"], "metrics": ["revenue"]},
+    "facts": [
+      {"ticker": "CRWV", "label": "Undelivered contracted power%", "fiscal_period": "instant", "period_end": "2026-06-30", "value": 748},
+      {"ticker": "CRWV", "metric": "revenue", "fiscal_period": "Q", "period_end": "2026-06-30", "value": 2575}
+    ],
+    "answer": [["748"], ["2,575", "2.58", "2.6"]]
+  },
+  {
+    "id": "aws-capex-explanation-recent",
+    "question": "How does Amazon explain the growth in its capital expenditures since 2025?",
+    "note": "Narrative must come from filings in the window. Before the date filter this returned 10-K text from 2020-2024.",
+    "route": {"tickers": ["AMZN"]},
+    "narrative": {"tickers": ["AMZN"], "filed_after": "2026-01-01"}
+  },
+  {
+    "id": "msft-power-risk",
+    "question": "What risks does Microsoft describe around electricity and power for its datacenters?",
+    "note": "The same risk-factor paragraph is in every filing; the passages must be distinct and include the current wording.",
+    "route": {"tickers": ["MSFT"]},
+    "narrative": {"tickers": ["MSFT"], "phrases": ["power"], "filed_after": "2026-07-01"},
+    "answer": [["power", "electric"]]
+  },
+  {
+    "id": "dominion-10q-mda-2024",
+    "question": "What did Dominion Energy say about data center load growth in its quarterly reports during 2024?",
+    "note": "Dominion's 2023-24 10-Qs had almost no narrative (6-10 chunks) until the coverage-based fallback.",
+    "route": {"tickers": ["D"]},
+    "narrative": {"tickers": ["D"], "phrases": ["data center"]}
+  }
+]

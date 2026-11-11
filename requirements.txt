@@ -10,6 +10,10 @@ voyageai==0.3.7
 # Query interface
 anthropic==0.78.0
 
-# Notebook (optional)
+# Notebooks (optional)
 jupyter
 ipykernel
+matplotlib
+
+# Tests
+pytest

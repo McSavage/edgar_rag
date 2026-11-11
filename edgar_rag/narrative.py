@@ -1,13 +1,19 @@
 """Narrative text extraction for RAG.
 
-Sectioning and chunking logic is carried over unchanged from the original
-edgar_parser.py, so chunks for already-ingested filings (and their embeddings)
-remain valid. Chunks now also record the filing accession.
+Sectioning and chunking logic is carried over from the original edgar_parser.py.
+Chunks record the filing accession. `python -m edgar_rag rebuild-chunks` re-extracts
+(and re-embeds) filings after a change here.
 """
 
 import re
 
-MAX_CHUNKS_PER_SECTION = 120
+# Cap per heading-delimited section. It guards against parse noise, but a filing whose whole
+# risk-factor section sits under one heading (Meta) runs to ~300 chunks, and at the previous
+# cap of 120 the rest was silently dropped.
+MAX_CHUNKS_PER_SECTION = 500
+# Below this share of the document's non-table text, the heading-based split is assumed to
+# have missed the body (few usable headings), and the TOC / Item parsers are tried as well.
+MIN_HEADED_COVERAGE = 0.2
 
 SECTION_CANONICAL_MAP = {
     'risks related to our product offerings': 'Risk Factors - Product Offerings',
@@ -321,10 +327,16 @@ def extract_narrative_chunks(filing, ticker):
     # Headed markdown (the common case) first. If that yields nothing -- markdown with no
     # usable headings, where everything lands in a 'HEADER' section that is filtered out --
     # recover real sections from a prospectus-style TOC or the 10-K/10-Q Item parser.
+    # The fallback also runs when the headings only caught a sliver of the text (Dominion's
+    # 2023-24 10-Qs have headings for the short Items but none for MD&A: 5K of 218K characters),
+    # and whichever split recovers more text wins.
     pieces = _chunk_sections(split_into_sections(markdown), MAX_CHUNKS_PER_SECTION, split_paragraphs=False)
-    if not pieces:
+    body_chars = sum(len(line) for line in markdown.split('\n') if '|' not in line)
+    if _chars(pieces) < MIN_HEADED_COVERAGE * body_chars:
         sections = toc_sections(markdown) or (item_sections(filing) if filing_type in ("10-K", "10-Q") else [])
-        pieces = _chunk_sections(sections, TOC_MAX_CHUNKS_PER_SECTION, split_paragraphs=True)
+        recovered = _chunk_sections(sections, TOC_MAX_CHUNKS_PER_SECTION, split_paragraphs=True)
+        if _chars(recovered) > _chars(pieces):
+            pieces = recovered
 
     return [{
         'accession': accession,
@@ -335,6 +347,10 @@ def extract_narrative_chunks(filing, ticker):
         'chunk_index': i,
         'chunk_text': chunk,
     } for section_name, i, chunk in pieces], "ok"
+
+
+def _chars(pieces):
+    return sum(len(chunk) for _, _, chunk in pieces)
 
 
 def _chunk_sections(sections, max_chunks, split_paragraphs):
